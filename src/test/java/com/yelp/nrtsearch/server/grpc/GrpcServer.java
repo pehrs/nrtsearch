@@ -452,7 +452,7 @@ public class GrpcServer {
         RestoreIndex restoreIndex =
             RestoreIndex.newBuilder()
                 .setServiceName("testservice")
-                .setResourceName("foo_latest_version")
+                .setResourceName("testresource")
                 .build();
         startIndexBuilder.setRestore(restoreIndex);
         RestoreStateHandler.restore(
