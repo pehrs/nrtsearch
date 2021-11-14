@@ -118,7 +118,7 @@ public class TarImplTest {
     }
   }
 
-  static boolean dirsMatch(File file1, File file2, List<String> ignoreFileNames)
+  public static boolean dirsMatch(File file1, File file2, List<String> ignoreFileNames)
       throws IOException {
     if (file1.isDirectory() && file2.isDirectory()) {
       List<File> files1 =

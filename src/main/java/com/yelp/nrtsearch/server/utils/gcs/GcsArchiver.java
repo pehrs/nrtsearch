@@ -13,16 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.yelp.nrtsearch.server.utils;
+package com.yelp.nrtsearch.server.utils.gcs;
 
-import com.google.cloud.storage.Blob;
-import com.google.cloud.storage.BlobId;
-import com.google.cloud.storage.Storage;
 import com.google.inject.Inject;
+import com.yelp.nrtsearch.server.utils.Archiver;
+import com.yelp.nrtsearch.server.utils.Tar;
+import com.yelp.nrtsearch.server.utils.Tar.CompressionMode;
+import com.yelp.nrtsearch.server.utils.VersionedResource;
+import com.yelp.nrtsearch.server.utils.gcs.GcsStorageApi.GcsBlob;
+import com.yelp.nrtsearch.server.utils.gcs.GcsStorageApi.GcsBlobId;
+import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.channels.Channels;
+import java.nio.ByteBuffer;
+import java.nio.channels.WritableByteChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -31,6 +37,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import net.jpountz.lz4.LZ4FrameInputStream;
 import org.apache.commons.codec.DecoderException;
 import org.apache.commons.codec.binary.Hex;
@@ -47,24 +54,37 @@ public class GcsArchiver implements Archiver {
   private static final String TMP_SUFFIX = ".tmp";
   private static final String CURRENT_VERSION_NAME = "current";
 
-  private final Storage storage;
+  private final GcsStorageApi storage;
   private final Path archiverDirectory;
   private final String bucketName;
   private final Tar tar;
   private final boolean downloadAsStream;
+  private final String pathPrefix;
 
   @Inject
   public GcsArchiver(
-      final Storage storage,
+      final GcsStorageApi storage,
       final String bucketName,
+      final String gcsPathPrefix,
       final Path archiverDirectory,
       final Tar tar,
       final boolean downloadAsStream) {
     this.storage = storage;
     this.bucketName = bucketName;
+    this.pathPrefix = gcsPathPrefix;
     this.archiverDirectory = archiverDirectory;
     this.tar = tar;
     this.downloadAsStream = downloadAsStream;
+  }
+
+  @Inject
+  public GcsArchiver(
+      final GcsStorageApi storage,
+      final String bucketName,
+      final Path archiverDirectory,
+      final Tar tar,
+      final boolean downloadAsStream) {
+    this(storage, bucketName, null, archiverDirectory, tar, downloadAsStream);
   }
 
   @Override
@@ -74,21 +94,31 @@ public class GcsArchiver implements Archiver {
       Files.createDirectories(archiverDirectory);
     }
 
-    final String latestVersion = getVersionString(serviceName, resource, "_latest_version");
-    final String versionHash = getVersionString(serviceName, resource, latestVersion);
-    final Path resourceDestDirectory = archiverDirectory.resolve(resource);
-    final Path versionDirectory = resourceDestDirectory.resolve(versionHash);
-    final Path currentDirectory = resourceDestDirectory.resolve("current");
-    final Path tempCurrentLink = resourceDestDirectory.resolve(getTmpName());
-    final Path relativeVersionDirectory = Paths.get(versionHash);
+    String gsPath = getGsPath(serviceName, resource);
+
+    GcsBlobId gsPathId = GcsBlobId.of(this.bucketName, gsPath);
+    // Make sure we get the generation id
+    GcsBlob gsPathBlob = storage.get(gsPathId);
+    Long generationId = gsPathBlob.getGeneration();
+
+    final String resourceDir = String.format("%s/%s", serviceName, resource);
+    final Path resourceDestDirectory = archiverDirectory.resolve(resourceDir);
+    final Path versionDirectory = resourceDestDirectory.resolve("" + generationId);
 
     logger.info(
-        "Downloading resource {} for service {} version {} to directory {}",
+        "Downloading resource {} for service {} generation {} to directory {}",
         resource,
         serviceName,
-        versionHash,
+        generationId,
         versionDirectory);
-    getVersionContent(serviceName, resource, versionHash, versionDirectory);
+    getBlobContent(gsPathBlob, serviceName, resource, versionDirectory);
+
+    final Path currentDirectory = resourceDestDirectory.resolve("current");
+    final Path tempCurrentLink = resourceDestDirectory.resolve(getTmpName());
+
+    // final String versionPath = String.format("%s/%s/%s", serviceName, resource, generationId);
+    final String versionPath = String.format("%s", generationId);
+    final Path relativeVersionDirectory = Paths.get(versionPath);
 
     try {
       logger.info("Point current version symlink to new resource {}", resource);
@@ -99,7 +129,7 @@ public class GcsArchiver implements Archiver {
         FileUtils.deleteDirectory(tempCurrentLink.toFile());
       }
     }
-    cleanupFiles(versionHash, resourceDestDirectory);
+    cleanupFiles(versionPath, resourceDestDirectory);
     return currentDirectory;
   }
 
@@ -107,12 +137,68 @@ public class GcsArchiver implements Archiver {
   public String upload(
       String serviceName,
       String resource,
-      Path path,
+      Path sourceDir,
       Collection<String> filesToInclude,
       Collection<String> parentDirectoriesToInclude,
       boolean stream)
       throws IOException {
-    return null;
+    // FIXME: We ignore the streaming parameter as we decide wether
+    //  to use streaming based on the compressed file size.
+
+    String gsPath = getGsPath(serviceName, resource);
+    GcsBlobId gsPathId = GcsBlobId.of(this.bucketName, gsPath);
+    // BlobInfo blobInfo = BlobInfo.newBuilder(gsPathId).build();
+
+    String suffix = getSuffix();
+
+    // Build the temporary compressed file and upload it to GCS.
+    Path tmpFile = Files.createTempFile(String.format("%s-%s", serviceName, resource), suffix);
+    try (FileOutputStream compressedStream = new FileOutputStream(tmpFile.toFile())) {
+      tar.buildTar(sourceDir, compressedStream, filesToInclude, parentDirectoriesToInclude);
+
+      uploadToGcs(storage, tmpFile.toFile(), gsPathId);
+    } catch (Exception ex) {
+      throw new IOException(ex);
+    }
+
+    // Delete the temporary compressed file.
+    Files.delete(tmpFile);
+
+    // Blob gsBlob = storage.get(gsPathId, BlobGetOption.fields(BlobField.GENERATION));
+    GcsBlob gsBlob = storage.get(gsPathId);
+
+    return "" + gsBlob.getGeneration();
+  }
+
+  private String getSuffix() {
+    if (this.tar.getCompressionMode() == CompressionMode.GZIP) {
+      return ".tgz";
+    } else {
+      return ".tar.lz4";
+    }
+  }
+
+  private static void uploadToGcs(GcsStorageApi storage, File uploadFrom, GcsBlobId blobInfo)
+      throws IOException {
+    // For small files:
+    if (uploadFrom.length() < 1_000_000) {
+      byte[] bytes = Files.readAllBytes(uploadFrom.toPath());
+      storage.create(blobInfo, bytes);
+      return;
+    }
+
+    // For big files:
+    // When content is not available or large (1MB or more) it is recommended to write it in chunks
+    // via the blob's channel writer.
+    try (WritableByteChannel writer = storage.writer(blobInfo)) {
+      byte[] buffer = new byte[10_240];
+      try (InputStream input = Files.newInputStream(uploadFrom.toPath())) {
+        int limit;
+        while ((limit = input.read(buffer)) >= 0) {
+          writer.write(ByteBuffer.wrap(buffer, 0, limit));
+        }
+      }
+    }
   }
 
   @Override
@@ -129,12 +215,32 @@ public class GcsArchiver implements Archiver {
 
   @Override
   public List<String> getResources(String serviceName) {
-    return null;
+    List<String> archives = storage.listArchives(this.bucketName, serviceName);
+    if (tar.getCompressionMode() == CompressionMode.LZ4) {
+      return archives.stream()
+          .map(name -> name.replace(".tar.lz4", ""))
+          .collect(Collectors.toList());
+    } else {
+      return archives.stream().map(name -> name.replace(".tgz", "")).collect(Collectors.toList());
+    }
   }
 
   @Override
   public List<VersionedResource> getVersionedResource(String serviceName, String resource) {
     return null;
+  }
+
+  private String getGsPath(String serviceName, String resource) {
+
+    String suffix = "tgz";
+    if (tar.getCompressionMode().equals(Tar.CompressionMode.LZ4)) {
+      suffix = "tar.lz4";
+    }
+    if (this.pathPrefix != null && this.pathPrefix.length() > 0) {
+      return String.format("%s/%s/%s.%s", this.pathPrefix, serviceName, resource, suffix);
+    } else {
+      return String.format("%s/%s.%s", serviceName, resource, suffix);
+    }
   }
 
   private String getTmpName() {
@@ -145,28 +251,31 @@ public class GcsArchiver implements Archiver {
       final String serviceName, final String resource, final String version) throws IOException {
     final String absoluteResourcePath =
         String.format("%s/_version/%s/%s", serviceName, resource, version);
-    BlobId blobId = BlobId.of(this.bucketName, absoluteResourcePath);
-    try (InputStream input = Channels.newInputStream(storage.reader(blobId))) {
+    GcsBlobId blobId = GcsBlobId.of(this.bucketName, absoluteResourcePath);
+    // try (InputStream input = Channels.newInputStream(storage.reader(blobId))) {
+    try (InputStream input = storage.getInputStream(blobId)) {
       return IOUtils.toString(input);
     }
   }
 
-  private void getVersionContent(
-      final String serviceName, final String resource, final String hash, final Path destDirectory)
+  private void getBlobContent(
+      final GcsBlob gsPathBlob,
+      final String serviceName,
+      final String resource,
+      final Path destDirectory)
       throws IOException {
-    final String absoluteResourcePath = String.format("%s/%s/%s", serviceName, resource, hash);
+    // final String absoluteResourcePath = String.format("%s/%s", serviceName, resource);
     final Path parentDirectory = destDirectory.getParent();
     final Path tmpFile = parentDirectory.resolve(getTmpName());
-    final BlobId blobId = BlobId.of(this.bucketName, absoluteResourcePath);
 
     final InputStream gcsInputStream;
     if (downloadAsStream) {
       logger.info("Streaming download...");
-      gcsInputStream = Channels.newInputStream(storage.reader(blobId));
+      // gcsInputStream = Channels.newInputStream(gsPathBlob.reader());
+      gcsInputStream = gsPathBlob.asInputStream();
     } else {
-      logger.info("File download...");
-      Blob blob = storage.get(blobId);
-      blob.downloadTo(tmpFile);
+      logger.info("Blob download...");
+      gsPathBlob.downloadTo(tmpFile);
       gcsInputStream = new FileInputStream(tmpFile.toFile());
     }
     logger.info("Object streaming started...");
@@ -187,6 +296,9 @@ public class GcsArchiver implements Archiver {
       try {
         tar.extractTar(tarArchiveInputStream, tmpDirectory);
         Files.move(tmpDirectory, destDirectory);
+      } catch (Exception ex) {
+        ex.printStackTrace();
+        throw new RuntimeException(ex);
       } finally {
         if (Files.exists(tmpDirectory)) {
           FileUtils.deleteDirectory(tmpDirectory.toFile());
