@@ -45,7 +45,7 @@ public class TarEntry {
     }
   }
 
-  private static byte[] getTarFile(List<TarEntry> tarEntries) throws IOException {
+  public static byte[] getTarFile(List<TarEntry> tarEntries) throws IOException {
     try (final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
         final LZ4FrameOutputStream lz4CompressorOutputStream =
             new LZ4FrameOutputStream(byteArrayOutputStream);

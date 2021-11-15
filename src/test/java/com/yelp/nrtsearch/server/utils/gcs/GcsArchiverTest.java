@@ -18,27 +18,22 @@ package com.yelp.nrtsearch.server.utils.gcs;
 import static com.yelp.nrtsearch.server.grpc.GrpcServer.rmDir;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Mockito.when;
 
 import com.amazonaws.util.IOUtils;
-import com.google.cloud.storage.Blob;
-import com.google.cloud.storage.BlobId;
-import com.google.cloud.storage.BlobInfo;
-import com.google.cloud.storage.Storage;
-import com.google.cloud.storage.Storage.BlobTargetOption;
 import com.yelp.nrtsearch.server.utils.Archiver;
 import com.yelp.nrtsearch.server.utils.Tar.CompressionMode;
+import com.yelp.nrtsearch.server.utils.TarEntry;
 import com.yelp.nrtsearch.server.utils.TarImpl;
 import com.yelp.nrtsearch.server.utils.TarImplTest;
 import com.yelp.nrtsearch.server.utils.gcs.GcsStorageApi.GcsBlobId;
 import java.io.ByteArrayInputStream;
-import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.zip.GZIPInputStream;
 import net.jpountz.lz4.LZ4FrameInputStream;
@@ -48,7 +43,6 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,30 +80,6 @@ public class GcsArchiverTest {
     this.gzArchiverDirectory = folder.newFolder("gcs-gz").toPath();
     TarImpl gzTar = new TarImpl(CompressionMode.GZIP);
     gzArchiver = new GcsArchiver(gzStorage, BUCKET_NAME, gzArchiverDirectory, gzTar, false);
-  }
-
-  @Test
-  public void testGcsApi() throws IOException {
-
-    String projectId = "fake-project-for-unit-testing";
-    String bucketName = "bucket";
-    String objectName = "my/path/to/object";
-    String resourceName = "addDocs.txt";
-
-    Storage storage = Mockito.mock(Storage.class);
-    BlobId blobId = BlobId.of(bucketName, objectName);
-    BlobInfo blobInfo = BlobInfo.newBuilder(blobId).build();
-    BlobTargetOption targetOptions = BlobTargetOption.userProject(projectId);
-    Blob blob = Mockito.mock(Blob.class);
-    when(storage.create(blobInfo, targetOptions)).thenReturn(blob);
-
-    ClassLoader classLoader = getClass().getClassLoader();
-    File file = new File(classLoader.getResource(resourceName).getFile());
-
-    storage.create(blobInfo, Files.readAllBytes(file.toPath()));
-
-    System.out.println(
-        "File " + resourceName + " uploaded to bucket " + bucketName + " as " + objectName);
   }
 
   /**
@@ -184,21 +154,7 @@ public class GcsArchiverTest {
     String suffix = LZ4_SUFFIX;
     Archiver archiver = lz4Archiver;
     Path archiverDirectory = lz4ArchiverDirectory;
-
     Path sourceDir = createDirWithFiles(archiverDirectory, service, resource);
-
-    // begin: MOCK
-    // Long generationId = 424242L;
-
-    // BlobId{bucket=gcs-archiver-unittest, name=testservice/testresource.tar.lz4, generation=null}
-    // storage.get(gsPathId, BlobGetOption.fields(BlobField.GENERATION))
-    String gsPath = String.format("%s/%s%s", service, resource, suffix);
-    GcsBlobId gsPathId = GcsBlobId.of(BUCKET_NAME, gsPath);
-    //    Blob gsBlob = Mockito.mock(Blob.class);
-    //    when(gsBlob.getGeneration()).thenReturn(generationId);
-    //    when(storage.get(gsPathId,
-    // BlobGetOption.fields(BlobField.GENERATION))).thenReturn(gsBlob);
-    // lz4Storage.create(gsPathId, "".getBytes(StandardCharsets.UTF_8), generationId);
 
     String versionHash = archiver.upload(service, resource, sourceDir, List.of(), List.of(), false);
     archiver.blessVersion(service, resource, versionHash);
@@ -206,6 +162,39 @@ public class GcsArchiverTest {
     Path parentPath = downloadPath.getParent();
     Path path = parentPath.resolve(versionHash);
     assertTrue(path.toFile().exists());
+  }
+
+  @Test
+  public void testCleanup() throws IOException {
+    String suffix = LZ4_SUFFIX;
+    Archiver archiver = lz4Archiver;
+    Path archiverDirectory = lz4ArchiverDirectory;
+    GcsStorageLocalFs storage = lz4Storage;
+
+    final Path dontDeleteThisDirectory =
+        Files.createDirectory(archiverDirectory.resolve("somerandomsubdirectory"));
+
+    final TarEntry tarEntry = new TarEntry("testresource/foo", "testcontent");
+    byte[] tar1Bytes = TarEntry.getTarFile(Arrays.asList(tarEntry));
+    Long tar1genId = 12345678942L;
+    storage.create(
+        GcsBlobId.of(BUCKET_NAME, "testservice/testresource.tar.lz4"), tar1Bytes, tar1genId);
+
+    byte[] tar2Bytes = TarEntry.getTarFile(Arrays.asList(tarEntry));
+    Long tar2genId = 12345678943L;
+    storage.create(
+        GcsBlobId.of(BUCKET_NAME, "testservice/testresource.tar.lz4"), tar2Bytes, tar2genId);
+
+    final Path firstLocation = archiver.download("testservice", "testresource").toRealPath();
+    Assert.assertTrue(Files.exists(firstLocation.resolve("testresource/foo")));
+
+    //    s3.putObject(BUCKET_NAME, "testservice/_version/testresource/1", "cafe");
+    //
+    //    final Path secondLocation = archiver.download("testservice", "testresource").toRealPath();
+    //
+    //    Assert.assertFalse(Files.exists(firstLocation.resolve("testresource/foo")));
+    //    Assert.assertTrue(Files.exists(secondLocation.resolve("testresource/foo")));
+    //    Assert.assertTrue(Files.exists(dontDeleteThisDirectory));
   }
 
   @Test
