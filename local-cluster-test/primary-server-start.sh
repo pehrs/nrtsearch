@@ -7,5 +7,6 @@ docker run \
        -p 6000:6000 \
        -p 6001:6001 \
        -v ${script_dir}/primary.yaml:/primary.yaml \
+       -v /spotify:/spotify \
        grpc-gateway:latest \
        ./build/install/nrtsearch/bin/lucene-server /primary.yaml

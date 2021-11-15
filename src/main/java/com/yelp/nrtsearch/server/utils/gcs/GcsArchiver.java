@@ -204,12 +204,14 @@ public class GcsArchiver implements Archiver {
   @Override
   public boolean blessVersion(String serviceName, String resource, String versionHash)
       throws IOException {
+    // FIXME:
     return false;
   }
 
   @Override
   public boolean deleteVersion(String serviceName, String resource, String versionHash)
       throws IOException {
+    // FIXME:
     return false;
   }
 
@@ -227,7 +229,8 @@ public class GcsArchiver implements Archiver {
 
   @Override
   public List<VersionedResource> getVersionedResource(String serviceName, String resource) {
-    return null;
+    // FIXME:
+    throw new RuntimeException("Not implemented yet!");
   }
 
   private String getGsPath(String serviceName, String resource) {

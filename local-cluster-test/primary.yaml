@@ -2,3 +2,11 @@ nodeName: "primary1"
 hostName: "localhost"
 port: "6000"
 replicationPort: "6001"
+
+bucketName: eu-yggdrasil-storage-version-test
+downloadAsStream: false
+
+archiveDirectory: /spotify/nrtsearch/primary/archive
+stateDir: /spotify/nrtsearch/primary/state
+indexDir: /spotify/nrtsearch/primary/index
+pluginSearchPath: /spotify/nrtsearch/primary/plugins

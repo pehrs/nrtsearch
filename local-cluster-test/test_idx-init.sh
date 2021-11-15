@@ -81,6 +81,11 @@ $replica1_client registerFields -f <(cat <<EOF
 EOF
 )
 
+# If running locally:
+#  "primaryAddress": "127.0.0.1",
+# If running in a local docker container:
+#   "primaryAddress": "172.17.0.1",
+
 $replica1_client startIndex -f <(cat <<EOF
 {
   "indexName" : "test_idx",
@@ -97,14 +102,14 @@ EOF
 #./build/install/nrtsearch/bin/lucene-client writeNRT -i test_idx -p 6001
 #sleep 1
 
-$replica1_client search -f <(cat <<EOF
-{
-  "indexName": "test_idx",
-  "startHit": 0,
-  "topHits": 100,
-  "retrieveFields": ["doc_id", "license_no", "vendor_name"],
-  "queryText": "vendor_name:first vendor"
-}
-EOF
-)
+#$replica1_client search -f <(cat <<EOF
+#{
+#  "indexName": "test_idx",
+#  "startHit": 0,
+#  "topHits": 100,
+#  "retrieveFields": ["doc_id", "license_no", "vendor_name"],
+#  "queryText": "vendor_name:first vendor"
+#}
+#EOF
+#)
  

@@ -3,3 +3,11 @@ hostName: "localhost"
 port: "7100"
 replicationPort: "7101"
 syncInitialNrtPoint: true
+
+bucketName: eu-yggdrasil-storage-version-test
+downloadAsStream: false
+
+archiveDirectory: /spotify/nrtsearch/replica1/archive
+stateDir: /spotify/nrtsearch/replica1/state
+indexDir: /spotify/nrtsearch/replica1/index
+pluginSearchPath: /spotify/nrtsearch/replica1/plugins

@@ -9,5 +9,6 @@ docker run \
        -p 7100:7100 \
        -p 7101:7101 \
        -v ${script_dir}/replica1.yaml:/replica.yaml \
+       -v /spotify:/spotify \
        grpc-gateway:latest \
        ./build/install/nrtsearch/bin/lucene-server /replica.yaml

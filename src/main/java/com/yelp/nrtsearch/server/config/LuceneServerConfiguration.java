@@ -32,15 +32,15 @@ public class LuceneServerConfiguration {
   private static final Pattern ENV_VAR_PATTERN = Pattern.compile("\\$\\{([A-Za-z0-9_]+)}");
 
   private static final long AS_LARGE_AS_INFINITE = TimeUnit.DAYS.toSeconds(1000L);
-  public static final Path DEFAULT_USER_DIR =
+  private static final Path DEFAULT_USER_DIR =
       Paths.get(System.getProperty("user.home"), "lucene", "server");
-  public static final Path DEFAULT_ARCHIVER_DIR =
+  private static final Path DEFAULT_ARCHIVER_DIR =
       Paths.get(DEFAULT_USER_DIR.toString(), "archiver");
   public static final Path DEFAULT_BOTO_CFG_PATH =
       Paths.get(DEFAULT_USER_DIR.toString(), "boto.cfg");
-  public static final Path DEFAULT_STATE_DIR =
+  private static final Path DEFAULT_STATE_DIR =
       Paths.get(DEFAULT_USER_DIR.toString(), "default_state");
-  public static final Path DEFAULT_INDEX_DIR =
+  private static final Path DEFAULT_INDEX_DIR =
       Paths.get(DEFAULT_USER_DIR.toString(), "default_index");
   private static final String DEFAULT_BUCKET_NAME = "DEFAULT_ARCHIVE_BUCKET";
   private static final String DEFAULT_HOSTNAME = "localhost";

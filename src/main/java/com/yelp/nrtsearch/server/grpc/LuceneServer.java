@@ -30,7 +30,9 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.util.JsonFormat;
+import com.yelp.nrtsearch.GCSLuceneServerModule;
 import com.yelp.nrtsearch.LuceneServerModule;
+import com.yelp.nrtsearch.S3LuceneServerModule;
 import com.yelp.nrtsearch.server.MetricsRequestHandler;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
 import com.yelp.nrtsearch.server.config.QueryCacheConfig;
@@ -251,17 +253,32 @@ public class LuceneServer {
             "Optional yaml config file. Defaults to <resources>/lucene_server_default_configuration.yaml")
     private File optionalConfigFile;
 
+    @CommandLine.Option(
+        names = "--gcs",
+        required = false,
+        defaultValue = "false",
+        description = "Use GCS as backup store instead of S3, Default: use S3")
+    private boolean useGCS;
+
     public Optional<File> maybeConfigFile() {
       return Optional.ofNullable(optionalConfigFile);
     }
 
     @Override
     public Integer call() throws Exception {
-      Injector injector = Guice.createInjector(new LuceneServerModule(this));
+      Injector injector = createInjector();
       LuceneServer luceneServer = injector.getInstance(LuceneServer.class);
       luceneServer.start();
       luceneServer.blockUntilShutdown();
       return 0;
+    }
+
+    private Injector createInjector() {
+      if(this.useGCS) {
+        return Guice.createInjector(new GCSLuceneServerModule(this));
+      } else {
+        return Guice.createInjector(new S3LuceneServerModule(this));
+      }
     }
   }
 
