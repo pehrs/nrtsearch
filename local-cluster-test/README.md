@@ -2,6 +2,14 @@
 
 These scripts will use docker to setup one primary, one replica and a grpc-rest-gw
 
+# Setup
+
+Please make sure you have buildt the nrtsearch server and grpc gw before running any of the scripts below.
+
+```
+./gradlew clean installDist test buildGrpcGateway
+```
+
 # Run
 
 ```
