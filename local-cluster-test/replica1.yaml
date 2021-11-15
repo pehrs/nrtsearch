@@ -1,0 +1,5 @@
+nodeName: "replica1"
+hostName: "localhost"
+port: "7100"
+replicationPort: "7101"
+syncInitialNrtPoint: true

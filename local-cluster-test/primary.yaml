@@ -1,0 +1,4 @@
+nodeName: "primary1"
+hostName: "localhost"
+port: "6000"
+replicationPort: "6001"

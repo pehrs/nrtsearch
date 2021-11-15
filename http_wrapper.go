@@ -17,8 +17,12 @@ import (
 var (
   // command-line options:
   // gRPC server endpoint
-  grpc_server_hostport =  fmt.Sprintf("localhost:%s", os.Args[1])
-  rest_server_hostport =  fmt.Sprintf(":%s", os.Args[2])
+	// example:
+	//   grpc-gw localhost:6000 0.0.0.0:6080
+	// or (in docker container):
+	//   grpc-gw 172.17.0.1:6000 :6080
+  grpc_server_hostport =  fmt.Sprintf("%s", os.Args[1])
+  rest_server_hostport =  fmt.Sprintf("%s", os.Args[2])
   grpcServerEndpoint = flag.String("grpc-server-endpoint",  grpc_server_hostport, "gRPC server endpoint")
 )
 
