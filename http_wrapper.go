@@ -23,6 +23,7 @@ var (
 	//   grpc-gw 172.17.0.1:6000 :6080
   grpc_server_hostport =  fmt.Sprintf("%s", os.Args[1])
   rest_server_hostport =  fmt.Sprintf("%s", os.Args[2])
+  swagger_hostport =  fmt.Sprintf("%s", os.Args[3])
   grpcServerEndpoint = flag.String("grpc-server-endpoint",  grpc_server_hostport, "gRPC server endpoint")
 )
 
@@ -41,6 +42,16 @@ func run() error {
   if err != nil {
     return err
   }
+
+	swaggerUiFs := http.FileServer(http.Dir("./grpc-gateway/swaggerui"))
+	http.Handle("/swaggerui/", http.StripPrefix("/swaggerui/", swaggerUiFs))
+	grpcFs := http.FileServer(http.Dir("./grpc-gateway"))
+	http.Handle("/grpc/", http.StripPrefix("/grpc/", grpcFs))
+
+	go func() {
+		// Spawn the Swagger server in `other` goroutine
+		log.Fatal(http.ListenAndServe(swagger_hostport, nil))
+	}()
 
   // Start HTTP server (and proxy calls to gRPC server endpoint)
   return http.ListenAndServe(rest_server_hostport, mux)

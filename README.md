@@ -62,7 +62,11 @@ Note: This code has been tested on *Java14*
 # Run REST Server (use the appropriate binary for your platform e.g. for mac os)
 
 ```
-./build/install/nrtsearch/bin/http_wrapper-darwin-amd64 <gRPC_PORT> <REST_PORT>
+./build/install/nrtsearch/bin/http_wrapper-darwin-amd64 <gRPC_HOST_AND_PORT> <REST_HOST_AND_PORT> <SWAGGER_HOST_AND_PORT>
+
+#Example
+
+./build/install/nrtsearch/bin/http_wrapper-darwin-amd64 127.0.0.1:6000 :6080 :8088
 ```
 
 # Example to run some basic client commands
