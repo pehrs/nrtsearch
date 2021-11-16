@@ -1,6 +1,8 @@
 #!/bin/bash
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
 
+# FIXME: This is WIP, I'm trying to figure out what is needed when primary and replica servers restart.
+
 # Seems like we have to start an index if the servers are restarted...
 
 # Primary

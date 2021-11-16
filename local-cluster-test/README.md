@@ -1,6 +1,6 @@
 # Simple cluster setup test 
 
-These scripts will use docker to setup one primary, one replica and a grpc-rest-gw
+These scripts will use docker to setup one primary, one replica and a rest gateways for them.
 
 # Setup
 

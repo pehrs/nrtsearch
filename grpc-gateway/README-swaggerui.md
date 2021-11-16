@@ -1,8 +1,8 @@
-# Grpc Gateway
+# Grpc Gateway - SwaggerUI
 
 # Setup (or update)
 
-The swagger-ui dir is a copy from the dist directory from the [swagger-ui repo](https://github.com/swagger-api/swagger-ui)
+The [swaggerui](swaggerui) dir is a copy from the [dist directory](https://github.com/swagger-api/swagger-ui/tree/master/dist) from the [swagger-ui repo](https://github.com/swagger-api/swagger-ui)
 
 Also you should change the line:
 ```
