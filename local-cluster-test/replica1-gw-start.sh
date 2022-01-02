@@ -3,6 +3,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
 
 docker run \
        -d \
+       --net nrtsearch-net \
        --name replica1-gw \
        -p 6081:6080 \
        -p 8081:8088 \

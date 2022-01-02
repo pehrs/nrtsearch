@@ -1100,6 +1100,25 @@ public class LuceneServer {
       }
     }
 
+    // @Override
+    public void list(
+        HealthCheckRequest request, StreamObserver<HealthCheckResponse> responseObserver) {
+      try {
+        HealthCheckResponse reply =
+            HealthCheckResponse.newBuilder().setHealth(TransferStatusCode.Done).build();
+        logger.debug("HealthCheckResponse returned " + reply.toString());
+        responseObserver.onNext(reply);
+        responseObserver.onCompleted();
+      } catch (Exception e) {
+        logger.warn("error while trying to get status", e);
+        responseObserver.onError(
+            Status.INVALID_ARGUMENT
+                .withDescription("error while trying to get status")
+                .augmentDescription(e.getMessage())
+                .asRuntimeException());
+      }
+    }
+
     /**
      * Returns a valid response only if all indices in {@link GlobalState} are started or if any
      * index names are provided in {@link ReadyCheckRequest} returns a valid response if those

@@ -276,8 +276,8 @@ service LuceneServer {
     /* healthcheck */
     rpc status (HealthCheckRequest) returns (HealthCheckResponse) {
         option (google.api.http) = {
-      get: "/v1/status"
-    };
+            get: "/v1/status"
+        };
 
     }
 

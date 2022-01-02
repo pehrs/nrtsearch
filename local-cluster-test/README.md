@@ -12,7 +12,13 @@ Please make sure you have buildt the nrtsearch server and grpc gw before running
 
 # Run
 
+__FIXME:__ Change the calls to grpcurl instead of curl to skip the  gw-start scripts.
+
 ```
+
+# Create custom netwokr
+$ docker network create nrtsearch-net
+
 $ ./primary-server-start.sh
 
 $ ./replica1-server-start.sh
@@ -53,5 +59,7 @@ Once your test is done just kill and remove the docker containers:
 $ docker kill primary replica1 primary-gw replica1-gw
 
 $ docker rm primary replica1 primary-gw replica1-gw
+
+$ docker network rm nrtsearch-net
 ```
 

@@ -50,7 +50,7 @@ func run() error {
 
 	go func() {
 		// Spawn the Swagger server in `other` goroutine
-		log.Fatal(http.ListenAndServe(swagger_hostport, nil))
+		glog.Fatal(http.ListenAndServe(swagger_hostport, nil))
 	}()
 
   // Start HTTP server (and proxy calls to gRPC server endpoint)

@@ -59,6 +59,10 @@ Note: This code has been tested on *Java14*
 ./gradlew buildGrpcGateway
 ```
 
+Some examples on how to run nrtsearch and the gateways with 
+Docker locally are in the [local-cluster-test](local-cluster-test) dir.
+
+
 # Run REST Server (use the appropriate binary for your platform e.g. for mac os)
 
 ```
@@ -67,9 +71,6 @@ Note: This code has been tested on *Java14*
 #Example
 ./build/install/nrtsearch/bin/http_wrapper-darwin-amd64 127.0.0.1:6000 :6080 :8088
 ```
-
-Some examples on how to run nrtsearch and the gateways with 
-Docker locally are in the [local-cluster-test](local-cluster-test) dir.
 
 # Example to run some basic client commands
 ## Create Index

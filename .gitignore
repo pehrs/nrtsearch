@@ -35,6 +35,8 @@ bin
 *~
 \#*\#
 
+nohub.out
+
 buid/
 data/
 install/

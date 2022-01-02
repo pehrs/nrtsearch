@@ -24,7 +24,6 @@ $primary_client settings -f <(cat <<EOF
 }
 EOF
 )
-
 $primary_client registerFields -f <(cat <<EOF
 {             "indexName": "test_idx",
               "field":
@@ -45,8 +44,8 @@ $primary_client startIndex -f <(cat <<EOF
 EOF
 )
 
-#echo "Waiting before adding documents"
-#sleep 15
+#sleep 5
+
 $primary_client addDocuments -i test_idx -t csv -f <(cat <<EOF
 doc_id,vendor_name,license_no
 0,first vendor,100;200
@@ -54,9 +53,9 @@ doc_id,vendor_name,license_no
 EOF
 )
 
- #
- # Replica-1 setup
- #
+#
+# Replica-1 setup
+#
 
 $replica1_client createIndex -i test_idx
 
@@ -68,7 +67,6 @@ $replica1_client settings -f <(cat <<EOF
 }
 EOF
 )
-
 $replica1_client registerFields -f <(cat <<EOF
 {             "indexName": "test_idx",
               "field":
@@ -90,7 +88,7 @@ $replica1_client startIndex -f <(cat <<EOF
 {
   "indexName" : "test_idx",
   "mode": "REPLICA",
-  "primaryAddress": "172.17.0.1",
+  "primaryAddress": "primary",
   "port": 6001
 }
 EOF

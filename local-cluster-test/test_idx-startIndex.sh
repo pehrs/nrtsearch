@@ -3,6 +3,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
 
 # FIXME: This is WIP, I'm trying to figure out what is needed when primary and replica servers restart.
 
+# FIXME: Change the curl calls to grpcurl calls instead to skip the http gateway
+
 # Seems like we have to start an index if the servers are restarted...
 
 # Primary
@@ -30,6 +32,6 @@ curl -s localhost:6081/v1/register_fields -X POST -d '{
 curl -s localhost:6081/v1/start_index -X POST -d '{
   "indexName": "test_idx",
   "mode": "REPLICA",
-  "primaryAddress": "172.17.0.1",
+  "primaryAddress": "primary",
   "port": 6001
 }' | jq .

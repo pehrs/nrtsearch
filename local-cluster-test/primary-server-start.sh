@@ -3,6 +3,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
 
 docker run \
        -d \
+       --net nrtsearch-net \
        --name primary \
        -p 6000:6000 \
        -p 6001:6001 \
