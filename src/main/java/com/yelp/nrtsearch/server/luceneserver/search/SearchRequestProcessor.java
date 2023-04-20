@@ -16,6 +16,7 @@
 package com.yelp.nrtsearch.server.luceneserver.search;
 
 import com.yelp.nrtsearch.server.grpc.CollectorResult;
+import com.yelp.nrtsearch.server.grpc.Highlight;
 import com.yelp.nrtsearch.server.grpc.PluginRescorer;
 import com.yelp.nrtsearch.server.grpc.ProfileResult;
 import com.yelp.nrtsearch.server.grpc.QueryRescorer;
@@ -28,7 +29,9 @@ import com.yelp.nrtsearch.server.luceneserver.ShardState;
 import com.yelp.nrtsearch.server.luceneserver.doc.DefaultSharedDocContext;
 import com.yelp.nrtsearch.server.luceneserver.field.FieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.IndexableFieldDef;
+import com.yelp.nrtsearch.server.luceneserver.field.TextBaseFieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.VirtualFieldDef;
+import com.yelp.nrtsearch.server.luceneserver.highlights.HighlightFetchTask;
 import com.yelp.nrtsearch.server.luceneserver.rescore.QueryRescore;
 import com.yelp.nrtsearch.server.luceneserver.rescore.RescoreOperation;
 import com.yelp.nrtsearch.server.luceneserver.rescore.RescoreTask;
@@ -39,7 +42,9 @@ import com.yelp.nrtsearch.server.luceneserver.search.collectors.AdditionalCollec
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.CollectorCreator;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.CollectorCreatorContext;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.DocCollector;
+import com.yelp.nrtsearch.server.luceneserver.search.collectors.HitCountCollector;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.LargeNumHitsCollector;
+import com.yelp.nrtsearch.server.luceneserver.search.collectors.MyTopSuggestDocsCollector;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.RelevanceCollector;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.SortFieldCollector;
 import com.yelp.nrtsearch.server.utils.ScriptParamsUtils;
@@ -49,7 +54,9 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.stream.Collectors;
+import org.apache.lucene.document.FieldType;
 import org.apache.lucene.facet.DrillDownQuery;
 import org.apache.lucene.facet.taxonomy.SearcherTaxonomyManager;
 import org.apache.lucene.queryparser.classic.MultiFieldQueryParser;
@@ -71,7 +78,9 @@ public class SearchRequestProcessor {
    */
   public static final int TOTAL_HITS_THRESHOLD = 1000;
 
-  private static final QueryNodeMapper QUERY_NODE_MAPPER = new QueryNodeMapper();
+  public static final String WILDCARD = "*";
+
+  private static final QueryNodeMapper QUERY_NODE_MAPPER = QueryNodeMapper.getInstance();
 
   private SearchRequestProcessor() {}
 
@@ -107,7 +116,7 @@ public class SearchRequestProcessor {
         .setStartHit(searchRequest.getStartHit())
         .setTopHits(searchRequest.getTopHits());
 
-    Map<String, FieldDef> queryVirtualFields = getVirtualFields(shardState, searchRequest);
+    Map<String, FieldDef> queryVirtualFields = getVirtualFields(indexState, searchRequest);
 
     Map<String, FieldDef> queryFields = new HashMap<>(queryVirtualFields);
     addIndexFields(indexState, queryFields);
@@ -138,14 +147,27 @@ public class SearchRequestProcessor {
     contextBuilder.setQuery(query);
 
     CollectorCreatorContext collectorCreatorContext =
-        new CollectorCreatorContext(searchRequest, indexState, shardState, queryFields);
-    contextBuilder.setCollector(buildDocCollector(collectorCreatorContext));
+        new CollectorCreatorContext(
+            searchRequest, indexState, shardState, queryFields, searcherAndTaxonomy);
+    DocCollector docCollector = buildDocCollector(collectorCreatorContext);
+    contextBuilder.setCollector(docCollector);
 
     contextBuilder.setRescorers(
         getRescorers(indexState, searcherAndTaxonomy.searcher, searchRequest));
     contextBuilder.setSharedDocContext(new DefaultSharedDocContext());
 
-    return contextBuilder.build(true);
+    Highlight highlight = searchRequest.getHighlight();
+    if (!highlight.getFieldsList().isEmpty()) {
+      verifyHighlights(indexState, highlight);
+      HighlightFetchTask highlightFetchTask =
+          new HighlightFetchTask(indexState, searcherAndTaxonomy, query, highlight);
+      contextBuilder.setHighlightFetchTask(highlightFetchTask);
+    }
+
+    SearchContext searchContext = contextBuilder.build(true);
+    // Give underlying collectors access to the search context
+    docCollector.setSearchContext(searchContext);
+    return searchContext;
   }
 
   /**
@@ -154,12 +176,11 @@ public class SearchRequestProcessor {
    * @throws IllegalArgumentException if there are multiple virtual fields with the same name
    */
   private static Map<String, FieldDef> getVirtualFields(
-      ShardState shardState, SearchRequest searchRequest) {
+      IndexState indexState, SearchRequest searchRequest) {
     if (searchRequest.getVirtualFieldsList().isEmpty()) {
       return new HashMap<>();
     }
 
-    IndexState indexState = shardState.indexState;
     Map<String, FieldDef> virtualFields = new HashMap<>();
     for (VirtualField vf : searchRequest.getVirtualFieldsList()) {
       if (virtualFields.containsKey(vf.getName())) {
@@ -187,6 +208,14 @@ public class SearchRequestProcessor {
   private static Map<String, FieldDef> getRetrieveFields(
       SearchRequest request, Map<String, FieldDef> queryFields) {
     Map<String, FieldDef> retrieveFields = new HashMap<>();
+    if (request.getRetrieveFieldsCount() == 1 && request.getRetrieveFields(0).equals(WILDCARD)) {
+      for (Entry<String, FieldDef> entry : queryFields.entrySet()) {
+        if (isRetrievable(entry.getValue())) {
+          retrieveFields.put(entry.getKey(), entry.getValue());
+        }
+      }
+      return retrieveFields;
+    }
     for (String field : request.getRetrieveFieldsList()) {
       FieldDef fieldDef = queryFields.get(field);
       if (fieldDef == null) {
@@ -289,7 +318,7 @@ public class SearchRequestProcessor {
 
   /** Fold in any drillDowns requests into the query. */
   private static DrillDownQuery addDrillDowns(IndexState state, Query q) {
-    return new DrillDownQuery(state.facetsConfig, q);
+    return new DrillDownQuery(state.getFacetsConfig(), q);
   }
 
   /**
@@ -305,18 +334,28 @@ public class SearchRequestProcessor {
             searchRequest.getCollectorsMap().entrySet().stream()
                 .map(
                     e ->
-                        CollectorCreator.createCollectorManager(
-                            collectorCreatorContext, e.getKey(), e.getValue()))
+                        CollectorCreator.getInstance()
+                            .createCollectorManager(
+                                collectorCreatorContext, e.getKey(), e.getValue()))
                 .collect(Collectors.toList());
-    if (searchRequest.getQuerySort().getFields().getSortedFieldsList().isEmpty()) {
+
+    DocCollector docCollector;
+    if (searchRequest.getQuery().hasCompletionQuery()) {
+      docCollector = new MyTopSuggestDocsCollector(collectorCreatorContext, additionalCollectors);
+    } else if (searchRequest.getQuerySort().getFields().getSortedFieldsList().isEmpty()) {
       if (hasLargeNumHits(searchRequest)) {
-        return new LargeNumHitsCollector(collectorCreatorContext, additionalCollectors);
+        docCollector = new LargeNumHitsCollector(collectorCreatorContext, additionalCollectors);
       } else {
-        return new RelevanceCollector(collectorCreatorContext, additionalCollectors);
+        docCollector = new RelevanceCollector(collectorCreatorContext, additionalCollectors);
       }
     } else {
-      return new SortFieldCollector(collectorCreatorContext, additionalCollectors);
+      docCollector = new SortFieldCollector(collectorCreatorContext, additionalCollectors);
     }
+    // If we don't need hits, just count recalled docs
+    if (docCollector.getNumHitsToCollect() == 0) {
+      docCollector = new HitCountCollector(collectorCreatorContext, additionalCollectors);
+    }
+    return docCollector;
   }
 
   /** If this query needs enough hits to use a {@link LargeNumHitsCollector}. */
@@ -368,5 +407,33 @@ public class SearchRequestProcessor {
               .build());
     }
     return rescorers;
+  }
+
+  private static void verifyHighlights(IndexState indexState, Highlight highlight) {
+    for (String fieldName : highlight.getFieldsList()) {
+      FieldDef field = indexState.getField(fieldName);
+      if (!(field instanceof TextBaseFieldDef)) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Field %s is not a text field and does not support highlights", fieldName));
+      }
+      if (!((TextBaseFieldDef) field).isSearchable()) {
+        throw new IllegalArgumentException(
+            String.format("Field %s is not searchable and cannot support highlights", fieldName));
+      }
+      if (!((TextBaseFieldDef) field).isStored()) {
+        throw new IllegalArgumentException(
+            String.format("Field %s is not stored and cannot support highlights", fieldName));
+      }
+      FieldType fieldType = ((TextBaseFieldDef) field).getFieldType();
+      if (!fieldType.storeTermVectors()
+          || !fieldType.storeTermVectorPositions()
+          || !fieldType.storeTermVectorOffsets()) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Field %s does not have term vectors with positions and offsets and cannot support highlights",
+                fieldName));
+      }
+    }
   }
 }

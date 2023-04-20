@@ -15,6 +15,9 @@
  */
 package com.yelp.nrtsearch.server.cli;
 
+import com.yelp.nrtsearch.server.grpc.FieldDefRequest;
+import com.yelp.nrtsearch.server.grpc.IndexLiveSettings;
+import com.yelp.nrtsearch.server.grpc.IndexSettings;
 import com.yelp.nrtsearch.server.grpc.LuceneServerClient;
 import java.util.concurrent.Callable;
 import picocli.CommandLine;
@@ -33,15 +36,66 @@ public class CreateIndexCommand implements Callable<Integer> {
       required = true)
   private String indexName;
 
+  @CommandLine.Option(
+      names = {"--existsWithId"},
+      description = "UUID to identify existing state/data to use")
+  private String existsWithId;
+
+  @CommandLine.Option(
+      names = {"--settings"},
+      description = "Initialization of index settings, IndexSettings as json or @file/path")
+  private String settings;
+
+  @CommandLine.Option(
+      names = {"--liveSettings"},
+      description =
+          "Initialization of index live settings, IndexLiveSettings as json or @file/path")
+  private String liveSettings;
+
+  @CommandLine.Option(
+      names = {"--fields"},
+      description = "Initialization of index fields, FieldDefRequest as json or @file/path")
+  private String fields;
+
+  @CommandLine.Option(
+      names = {"--start"},
+      description = "If index should also be started using IndexStartConfig")
+  private boolean start;
+
   public String getIndexName() {
     return indexName;
+  }
+
+  public String getExistsWithId() {
+    return existsWithId;
   }
 
   @Override
   public Integer call() throws Exception {
     LuceneServerClient client = baseCmd.getClient();
     try {
-      client.createIndex(getIndexName());
+      IndexSettings indexSettings = null;
+      IndexLiveSettings indexLiveSettings = null;
+      FieldDefRequest fieldDefRequest = null;
+      if (settings != null) {
+        indexSettings =
+            CliUtils.mergeBuilderFromParam(settings, IndexSettings.newBuilder()).build();
+      }
+      if (liveSettings != null) {
+        indexLiveSettings =
+            CliUtils.mergeBuilderFromParam(liveSettings, IndexLiveSettings.newBuilder()).build();
+      }
+      if (fields != null) {
+        fieldDefRequest =
+            CliUtils.mergeBuilderFromParam(fields, FieldDefRequest.newBuilder()).build();
+      }
+      client.createIndex(
+          getIndexName(),
+          getExistsWithId(),
+          indexSettings,
+          indexLiveSettings,
+          fieldDefRequest,
+          start);
     } finally {
       client.shutdown();
     }

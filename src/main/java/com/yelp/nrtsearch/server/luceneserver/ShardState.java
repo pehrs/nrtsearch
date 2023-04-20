@@ -15,38 +15,36 @@
  */
 package com.yelp.nrtsearch.server.luceneserver;
 
-import com.google.common.annotations.VisibleForTesting;
+import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
+import com.yelp.nrtsearch.server.grpc.DeadlineUtils;
+import com.yelp.nrtsearch.server.grpc.IndexLiveSettings;
 import com.yelp.nrtsearch.server.grpc.ReplicationServerClient;
+import com.yelp.nrtsearch.server.luceneserver.SearchHandler.SearchHandlerException;
 import com.yelp.nrtsearch.server.luceneserver.field.FieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.IndexableFieldDef.FacetValueType;
+import com.yelp.nrtsearch.server.luceneserver.field.properties.GlobalOrdinalable;
+import com.yelp.nrtsearch.server.luceneserver.index.IndexStateManager;
+import com.yelp.nrtsearch.server.luceneserver.index.NrtIndexWriter;
 import com.yelp.nrtsearch.server.luceneserver.warming.WarmerConfig;
 import com.yelp.nrtsearch.server.monitoring.IndexMetrics;
 import com.yelp.nrtsearch.server.utils.FileUtil;
 import com.yelp.nrtsearch.server.utils.HostPort;
 import io.grpc.StatusRuntimeException;
 import java.io.Closeable;
-import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
-import java.net.InetAddress;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Phaser;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
-import org.apache.lucene.document.Document;
 import org.apache.lucene.facet.FacetsConfig;
 import org.apache.lucene.facet.sortedset.DefaultSortedSetDocValuesReaderState;
 import org.apache.lucene.facet.sortedset.SortedSetDocValuesReaderState;
@@ -62,6 +60,7 @@ import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
 import org.apache.lucene.index.KeepOnlyLastCommitDeletionPolicy;
 import org.apache.lucene.index.LiveIndexWriterConfig;
 import org.apache.lucene.index.MergePolicy;
@@ -69,7 +68,6 @@ import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.PersistentSnapshotDeletionPolicy;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.SortedSetDocValues;
-import org.apache.lucene.index.Term;
 import org.apache.lucene.search.ControlledRealTimeReopenThread;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ReferenceManager;
@@ -83,19 +81,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class ShardState implements Closeable {
-  private static final long INITIAL_SYNC_PRIMARY_WAIT_MS = 30000;
+  private static final Logger logger = LoggerFactory.getLogger(ShardState.class);
   public static final int REPLICA_ID = 0;
+  public static final String INDEX_DATA_DIR_NAME = "index";
+  public static final String TAXONOMY_DATA_DIR_NAME = "taxonomy";
   final ThreadPoolExecutor searchExecutor;
-  Logger logger = LoggerFactory.getLogger(ShardState.class);
 
-  /** {@link IndexState} for the index this shard belongs to */
-  public final IndexState indexState;
+  /** {@link IndexStateManager} for the index this shard belongs to */
+  private final IndexStateManager indexStateManager;
 
   /** Where Lucene's index is written */
-  public final Path rootDir;
+  private final Path rootDir;
 
   /** Which shard we are in this index */
-  public final int shardOrd;
+  private final int shardOrd;
 
   /** Base directory */
   public Directory origIndexDir;
@@ -104,7 +103,7 @@ public class ShardState implements Closeable {
   public Directory indexDir;
 
   /** Taxonomy directory */
-  Directory taxoDir;
+  private Directory taxoDir;
 
   /** Only non-null for "ordinary" (not replicated) index */
   public IndexWriter writer;
@@ -127,20 +126,20 @@ public class ShardState implements Closeable {
   public IndexWriter taxoInternalWriter;
 
   /** Maps snapshot gen -&gt; version. */
-  public final Map<Long, Long> snapshotGenToVersion = new ConcurrentHashMap<Long, Long>();
+  public final Map<Long, Long> snapshotGenToVersion = new ConcurrentHashMap<>();
 
   /**
    * Holds cached ordinals; doesn't use any RAM unless it's actually used when a caller sets
    * useOrdsCache=true.
    */
-  public final Map<String, OrdinalsReader> ordsCache = new HashMap<String, OrdinalsReader>();
+  private final Map<String, OrdinalsReader> ordsCache = new HashMap<>();
 
   /**
    * Enables lookup of previously used searchers, so follow-on actions (next page, drill
    * down/sideways/up, etc.) use the same searcher as the original search, as long as that searcher
    * hasn't expired.
    */
-  public final SearcherLifetimeManager slm = new SearcherLifetimeManager();
+  public volatile SearcherLifetimeManager slm = new SearcherLifetimeManager();
 
   /** Indexes changes, and provides the live searcher, possibly searching a specific generation. */
   private SearcherTaxonomyManager manager;
@@ -148,13 +147,13 @@ public class ShardState implements Closeable {
   private ReferenceManager<IndexSearcher> searcherManager;
 
   /** Thread to periodically reopen the index. */
-  public ControlledRealTimeReopenThread<SearcherTaxonomyManager.SearcherAndTaxonomy> reopenThread;
+  private ControlledRealTimeReopenThread<SearcherTaxonomyManager.SearcherAndTaxonomy> reopenThread;
 
   /** Used with NRT replication */
-  public ControlledRealTimeReopenThread<IndexSearcher> reopenThreadPrimary;
+  private ControlledRealTimeReopenThread<IndexSearcher> reopenThreadPrimary;
 
   /** Periodically wakes up and prunes old searchers from slm. */
-  SearcherPruningThread searcherPruningThread;
+  private SearcherPruningThread searcherPruningThread;
 
   /** Holds the persistent snapshots */
   public PersistentSnapshotDeletionPolicy snapshots;
@@ -162,22 +161,47 @@ public class ShardState implements Closeable {
   /** Holds the persistent taxonomy snapshots */
   public PersistentSnapshotDeletionPolicy taxoSnapshots;
 
-  private final boolean doCreate;
-
-  private final List<HostAndPort> replicas = new ArrayList<>();
+  private boolean doCreate;
 
   public final Map<IndexReader.CacheKey, Map<String, SortedSetDocValuesReaderState>> ssdvStates =
       new HashMap<>();
   private final Object ordinalBuilderLock = new Object();
 
-  public final String name;
+  private final String name;
   private KeepAlive keepAlive;
   // is this shard restored
   private boolean restored;
   private volatile boolean started = false;
 
+  public static String getShardDirectoryName(int shardOrd) {
+    return "shard" + shardOrd;
+  }
+
+  /**
+   * Notify the shard that the index live settings have been updated and provide the update {@link
+   * IndexLiveSettings} message.
+   *
+   * @param updateMessage updated settings message
+   */
+  public void updatedLiveSettings(IndexLiveSettings updateMessage) {
+    if (isStarted()) {
+      if (updateMessage.hasMaxRefreshSec() || updateMessage.hasMinRefreshSec()) {
+        logger.info("Restarting reopen thread");
+        restartReopenThread();
+      }
+      IndexState currentState = indexStateManager.getCurrent();
+      if (updateMessage.hasIndexRamBufferSizeMB()) {
+        if (writer != null) {
+          logger.info("Setting ram buffer size");
+          writer.getConfig().setRAMBufferSizeMB(currentState.getIndexRamBufferSizeMB());
+        }
+      }
+    }
+  }
+
   /** Restarts the reopen thread (called when the live settings have changed). */
   public void restartReopenThread() {
+    IndexState indexState = indexStateManager.getCurrent();
     if (reopenThread != null) {
       reopenThread.close();
     }
@@ -191,8 +215,11 @@ public class ShardState implements Closeable {
       assert nrtReplicaNode == null;
       // nocommit how to get taxonomy back?
       reopenThreadPrimary =
-          new ControlledRealTimeReopenThread<IndexSearcher>(
-              writer, searcherManager, indexState.maxRefreshSec, indexState.minRefreshSec);
+          new ControlledRealTimeReopenThread<>(
+              writer,
+              searcherManager,
+              indexState.getMaxRefreshSec(),
+              indexState.getMinRefreshSec());
       reopenThreadPrimary.setName("LuceneNRTPrimaryReopen-" + name);
       reopenThreadPrimary.start();
     } else if (manager != null) {
@@ -200,8 +227,8 @@ public class ShardState implements Closeable {
         reopenThread.close();
       }
       reopenThread =
-          new ControlledRealTimeReopenThread<SearcherTaxonomyManager.SearcherAndTaxonomy>(
-              writer, manager, indexState.maxRefreshSec, indexState.minRefreshSec);
+          new ControlledRealTimeReopenThread<>(
+              writer, manager, indexState.getMaxRefreshSec(), indexState.getMinRefreshSec());
       reopenThread.setName("LuceneNRTReopen-" + name);
       reopenThread.start();
     }
@@ -209,7 +236,10 @@ public class ShardState implements Closeable {
 
   /** True if this index is started. */
   public boolean isStarted() {
-    return started;
+    if (started) {
+      return isReplica() || (writer != null && writer.isOpen());
+    }
+    return false;
   }
 
   public boolean isRestored() {
@@ -240,7 +270,7 @@ public class ShardState implements Closeable {
     return nrtReplicaNode != null;
   }
 
-  public void waitForGeneration(long gen) throws InterruptedException, IOException {
+  public void waitForGeneration(long gen) throws InterruptedException {
     if (nrtPrimaryNode != null) {
       reopenThreadPrimary.waitForGeneration(gen);
     } else {
@@ -248,36 +278,45 @@ public class ShardState implements Closeable {
     }
   }
 
-  public static class HostAndPort {
-    public final InetAddress host;
-    public final int port;
-
-    public HostAndPort(InetAddress host, int port) {
-      this.host = host;
-      this.port = port;
-    }
-  }
-
-  public ShardState(IndexState indexState, int shardOrd, boolean doCreate) {
-    this.indexState = indexState;
+  /**
+   * Constructor.
+   *
+   * @param indexStateManager state manager for index
+   * @param indexName index name
+   * @param rootDir this index data root directory
+   * @param searchExecutor search thread pool
+   * @param shardOrd shard number
+   * @param doCreate if index should be created when started
+   */
+  public ShardState(
+      IndexStateManager indexStateManager,
+      String indexName,
+      Path rootDir,
+      ThreadPoolExecutor searchExecutor,
+      int shardOrd,
+      boolean doCreate) {
+    this.indexStateManager = indexStateManager;
     this.shardOrd = shardOrd;
-    if (indexState.rootDir == null) {
+    if (rootDir == null) {
       this.rootDir = null;
     } else {
-      this.rootDir = indexState.rootDir.resolve("shard" + shardOrd);
+      this.rootDir = rootDir.resolve(getShardDirectoryName(shardOrd));
     }
-    this.name = indexState.name + ":" + shardOrd;
+    this.name = indexName + ":" + shardOrd;
     this.doCreate = doCreate;
-    this.searchExecutor = indexState.getSearchThreadPoolExecutor();
+    this.searchExecutor = searchExecutor;
   }
 
   @Override
   public synchronized void close() throws IOException {
     logger.info(String.format("ShardState.close name= %s", name));
 
-    commit();
+    if (writer != null && writer.isOpen()) {
+      commit();
+    }
 
-    List<Closeable> closeables = new ArrayList<Closeable>();
+    started = false;
+    List<Closeable> closeables = new ArrayList<>();
     // nocommit catch exc & rollback:
     if (nrtPrimaryNode != null) {
       closeables.add(reopenThreadPrimary);
@@ -289,6 +328,7 @@ public class ShardState implements Closeable {
       closeables.add(indexDir);
       closeables.add(taxoDir);
       nrtPrimaryNode = null;
+      writer = null;
     } else if (nrtReplicaNode != null) {
       closeables.add(keepAlive);
       closeables.add(reopenThreadPrimary);
@@ -298,7 +338,7 @@ public class ShardState implements Closeable {
       closeables.add(slm);
       closeables.add(indexDir);
       closeables.add(taxoDir);
-      nrtPrimaryNode = null;
+      nrtReplicaNode = null;
     } else if (writer != null) {
       closeables.add(reopenThread);
       closeables.add(manager);
@@ -310,12 +350,21 @@ public class ShardState implements Closeable {
       closeables.add(taxoDir);
       writer = null;
     }
+    slm = new SearcherLifetimeManager();
 
     IOUtils.close(closeables);
   }
 
+  /** Set if the index should be created on next start. */
+  public void setDoCreate(boolean doCreate) {
+    this.doCreate = doCreate;
+  }
+
   /** Commit all state. */
   public synchronized long commit() throws IOException {
+    // This request may already have timed out on the client while waiting for the lock.
+    // If so, there is no reason to continue this heavyweight operation.
+    DeadlineUtils.checkDeadline("ShardState: commit " + this.name, "COMMIT");
 
     long gen;
 
@@ -370,19 +419,17 @@ public class ShardState implements Closeable {
       while (!done) {
         try {
           final SearcherLifetimeManager.Pruner byAge =
-              new SearcherLifetimeManager.PruneByAge(indexState.maxSearcherAgeSec);
-          final Set<Long> snapshots = new HashSet<Long>(snapshotGenToVersion.values());
+              new SearcherLifetimeManager.PruneByAge(
+                  indexStateManager.getCurrent().getMaxSearcherAgeSec());
+          final Set<Long> snapshots = new HashSet<>(snapshotGenToVersion.values());
           slm.prune(
-              new SearcherLifetimeManager.Pruner() {
-                @Override
-                public boolean doPrune(double ageSec, IndexSearcher searcher) {
-                  long version = ((DirectoryReader) searcher.getIndexReader()).getVersion();
-                  if (snapshots.contains(version)) {
-                    // Never time-out searcher for a snapshot:
-                    return false;
-                  } else {
-                    return byAge.doPrune(ageSec, searcher);
-                  }
+              (ageSec, searcher) -> {
+                long version = ((DirectoryReader) searcher.getIndexReader()).getVersion();
+                if (snapshots.contains(version)) {
+                  // Never time-out searcher for a snapshot:
+                  return false;
+                } else {
+                  return byAge.doPrune(ageSec, searcher);
                 }
               });
         } catch (IOException ioe) {
@@ -406,7 +453,7 @@ public class ShardState implements Closeable {
   }
 
   /** Start the searcher pruning thread. */
-  public void startSearcherPruningThread(CountDownLatch shutdownNow) {
+  private void startSearcherPruningThread(CountDownLatch shutdownNow) {
     // nocommit make one thread in GlobalState
     if (searcherPruningThread == null) {
       searcherPruningThread = new SearcherPruningThread(shutdownNow);
@@ -437,6 +484,7 @@ public class ShardState implements Closeable {
     @Override
     public IndexSearcher newSearcher(IndexReader reader, IndexReader previousReader)
         throws IOException {
+      IndexState indexState = indexStateManager.getCurrent();
       IndexSearcher searcher =
           new MyIndexSearcher(
               reader,
@@ -445,23 +493,25 @@ public class ShardState implements Closeable {
                   indexState.getSliceMaxDocs(),
                   indexState.getSliceMaxSegments(),
                   indexState.getVirtualShards()));
-      searcher.setSimilarity(indexState.sim);
+      searcher.setSimilarity(indexState.searchSimilarity);
       if (loadEagerOrdinals) {
-        loadEagerGlobalOrdinals(reader);
+        loadEagerGlobalOrdinals(reader, indexState);
       }
       if (collectMetrics) {
-        IndexMetrics.updateReaderStats(indexState.name, reader);
-        IndexMetrics.updateSearcherStats(indexState.name, searcher);
+        IndexMetrics.updateReaderStats(indexState.getName(), reader);
+        IndexMetrics.updateSearcherStats(indexState.getName(), searcher);
       }
       return searcher;
     }
 
-    private void loadEagerGlobalOrdinals(IndexReader reader) throws IOException {
-      for (Map.Entry<String, FieldDef> entry : indexState.eagerGlobalOrdinalFields.entrySet()) {
+    private void loadEagerGlobalOrdinals(IndexReader reader, IndexState indexState)
+        throws IOException {
+      for (Map.Entry<String, FieldDef> entry :
+          indexState.getEagerGlobalOrdinalFields().entrySet()) {
         // only sorted set doc values facet currently supported
         if (entry.getValue().getFacetValueType() == FacetValueType.SORTED_SET_DOC_VALUES) {
           // get state to populate cache
-          getSSDVStateForReader(reader, entry.getValue());
+          getSSDVStateForReader(indexState, reader, entry.getValue());
         } else {
           logger.warn(
               String.format(
@@ -469,37 +519,43 @@ public class ShardState implements Closeable {
                   entry.getKey(), entry.getValue().getFacetValueType().toString()));
         }
       }
+
+      for (Map.Entry<String, GlobalOrdinalable> entry :
+          indexState.getEagerFieldGlobalOrdinalFields().entrySet()) {
+        if (entry.getValue().usesOrdinals()) {
+          // get lookup to populate cache
+          entry.getValue().getOrdinalLookup(reader);
+        }
+      }
     }
   }
 
   /** Start this shard as standalone (not primary nor replica) */
-  public synchronized void start() throws Exception {
+  public synchronized void start() throws IOException {
 
     if (isStarted()) {
       throw new IllegalStateException("index \"" + name + "\" was already started");
     }
+    IndexState indexState = indexStateManager.getCurrent();
 
     try {
-
-      if (indexState.saveLoadState == null) {
-        indexState.initSaveLoadState();
-      }
-
       Path indexDirFile;
       if (rootDir == null) {
         indexDirFile = null;
       } else {
-        indexDirFile = rootDir.resolve("index");
+        indexDirFile = rootDir.resolve(INDEX_DATA_DIR_NAME);
       }
       origIndexDir =
-          indexState.df.open(indexDirFile, indexState.globalState.configuration.getPreloadConfig());
+          indexState
+              .getDirectoryFactory()
+              .open(
+                  indexDirFile, indexState.getGlobalState().getConfiguration().getPreloadConfig());
 
       // nocommit don't allow RAMDir
       // nocommit remove NRTCachingDir too?
       if ((origIndexDir instanceof MMapDirectory) == false) {
-        double maxMergeSizeMB =
-            indexState.getDoubleSetting("nrtCachingDirectoryMaxMergeSizeMB", 5.0);
-        double maxSizeMB = indexState.getDoubleSetting("nrtCachingDirectoryMaxSizeMB", 60.0);
+        double maxMergeSizeMB = indexState.getNrtCachingDirectoryMaxMergeSizeMB();
+        double maxSizeMB = indexState.getNrtCachingDirectoryMaxSizeMB();
         if (maxMergeSizeMB > 0 && maxSizeMB > 0) {
           indexDir = new NRTCachingDirectory(origIndexDir, maxMergeSizeMB, maxSizeMB);
         } else {
@@ -527,10 +583,12 @@ public class ShardState implements Closeable {
       if (rootDir == null) {
         taxoDirFile = null;
       } else {
-        taxoDirFile = rootDir.resolve("taxonomy");
+        taxoDirFile = rootDir.resolve(TAXONOMY_DATA_DIR_NAME);
       }
       taxoDir =
-          indexState.df.open(taxoDirFile, indexState.globalState.configuration.getPreloadConfig());
+          indexState
+              .getDirectoryFactory()
+              .open(taxoDirFile, indexState.getGlobalState().getConfiguration().getPreloadConfig());
 
       taxoSnapshots =
           new PersistentSnapshotDeletionPolicy(
@@ -539,7 +597,7 @@ public class ShardState implements Closeable {
               IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
 
       taxoWriter =
-          new DirectoryTaxonomyWriter(taxoDir, openMode) {
+          new DirectoryTaxonomyWriter(taxoDir, OpenMode.CREATE_OR_APPEND) {
             @Override
             protected IndexWriterConfig createIndexWriterConfig(
                 IndexWriterConfig.OpenMode openMode) {
@@ -558,8 +616,10 @@ public class ShardState implements Closeable {
           };
 
       writer =
-          new IndexWriter(
-              indexDir, indexState.getIndexWriterConfig(openMode, origIndexDir, shardOrd));
+          new NrtIndexWriter(
+              indexDir,
+              indexState.getIndexWriterConfig(openMode, origIndexDir, shardOrd),
+              indexState.getName());
       snapshots = (PersistentSnapshotDeletionPolicy) writer.getConfig().getIndexDeletionPolicy();
 
       // NOTE: must do this after writer, because SDP only
@@ -581,7 +641,7 @@ public class ShardState implements Closeable {
 
       restartReopenThread();
 
-      startSearcherPruningThread(indexState.globalState.shutdownNow);
+      startSearcherPruningThread(indexState.getGlobalState().getShutdownLatch());
       started = true;
     } finally {
       if (!started) {
@@ -595,51 +655,41 @@ public class ShardState implements Closeable {
             indexDir,
             taxoDir);
         writer = null;
+        slm = new SearcherLifetimeManager();
       }
     }
   }
 
   /**
-   * Start this index as primary, to NRT-replicate to replicas. primaryGen should be incremented
-   * each time a new primary is promoted for a given index.
+   * Start this index as primary, to NRT-replicate to replicas. primaryGen should increase each time
+   * a new primary is promoted for a given index.
+   *
+   * @param primaryGen generation to use for {@link NRTPrimaryNode}, uses value from global state if
+   *     -1
    */
-  public synchronized void startPrimary(long primaryGen, Path dataPath) throws Exception {
+  public synchronized void startPrimary(long primaryGen) throws IOException {
     if (isStarted()) {
       throw new IllegalStateException("index \"" + name + "\" was already started");
     }
-
+    IndexState indexState = indexStateManager.getCurrent();
     // nocommit share code better w/ start and startReplica!
 
     try {
-      // we have backups and are not creating a new index
-      // use that to load indexes and other state (registeredFields, settings)
-      if (!doCreate && dataPath != null) {
-        if (indexState.rootDir != null) {
-          synchronized (this) {
-            // copy downloaded data into rootDir
-            indexState.restoreDir(dataPath, indexState.rootDir);
-          }
-          indexState.initSaveLoadState();
-        }
-      }
-
-      if (indexState.saveLoadState == null) {
-        indexState.initSaveLoadState();
-      }
-
       Path indexDirFile;
       if (rootDir == null) {
         indexDirFile = null;
       } else {
-        indexDirFile = rootDir.resolve("index");
+        indexDirFile = rootDir.resolve(INDEX_DATA_DIR_NAME);
       }
       origIndexDir =
-          indexState.df.open(indexDirFile, indexState.globalState.configuration.getPreloadConfig());
+          indexState
+              .getDirectoryFactory()
+              .open(
+                  indexDirFile, indexState.getGlobalState().getConfiguration().getPreloadConfig());
 
       if ((origIndexDir instanceof MMapDirectory) == false) {
-        double maxMergeSizeMB =
-            indexState.getDoubleSetting("nrtCachingDirectoryMaxMergeSizeMB", 5.0);
-        double maxSizeMB = indexState.getDoubleSetting("nrtCachingDirectoryMaxSizeMB", 60.0);
+        double maxMergeSizeMB = indexState.getNrtCachingDirectoryMaxMergeSizeMB();
+        double maxSizeMB = indexState.getNrtCachingDirectoryMaxSizeMB();
         if (maxMergeSizeMB > 0 && maxSizeMB > 0) {
           indexDir = new NRTCachingDirectory(origIndexDir, maxMergeSizeMB, maxSizeMB);
         } else {
@@ -665,11 +715,13 @@ public class ShardState implements Closeable {
 
       // TODO: get facets working!
 
-      boolean verbose = indexState.globalState.configuration.getIndexVerbose();
+      boolean verbose = indexState.getGlobalState().getConfiguration().getIndexVerbose();
 
       writer =
-          new IndexWriter(
-              indexDir, indexState.getIndexWriterConfig(openMode, origIndexDir, shardOrd));
+          new NrtIndexWriter(
+              indexDir,
+              indexState.getIndexWriterConfig(openMode, origIndexDir, shardOrd),
+              indexState.getName());
       LiveIndexWriterConfig writerConfig = writer.getConfig();
       MergePolicy mergePolicy = writerConfig.getMergePolicy();
       // Disable merges while NrtPrimaryNode isn't initalized (ISSUE-210)
@@ -687,16 +739,19 @@ public class ShardState implements Closeable {
         snapshotGenToVersion.put(c.getGeneration(), sis.getVersion());
       }
 
+      long resolvedPrimaryGen =
+          primaryGen == -1 ? indexState.getGlobalState().getGeneration() : primaryGen;
       HostPort hostPort =
           new HostPort(
-              indexState.globalState.getHostName(), indexState.globalState.getReplicationPort());
+              indexState.getGlobalState().getHostName(),
+              indexState.getGlobalState().getReplicationPort());
       nrtPrimaryNode =
           new NRTPrimaryNode(
-              indexState.name,
+              indexStateManager,
               hostPort,
               writer,
               0,
-              primaryGen,
+              resolvedPrimaryGen,
               -1,
               new ShardSearcherFactory(false, true),
               verbose ? System.out : new PrintStream(OutputStream.nullOutputStream()));
@@ -709,8 +764,7 @@ public class ShardState implements Closeable {
               nrtPrimaryNode,
               new SearcherFactory() {
                 @Override
-                public IndexSearcher newSearcher(IndexReader r, IndexReader previousReader)
-                    throws IOException {
+                public IndexSearcher newSearcher(IndexReader r, IndexReader previousReader) {
                   IndexSearcher searcher =
                       new MyIndexSearcher(
                           r,
@@ -719,13 +773,13 @@ public class ShardState implements Closeable {
                               indexState.getSliceMaxDocs(),
                               indexState.getSliceMaxSegments(),
                               indexState.getVirtualShards()));
-                  searcher.setSimilarity(indexState.sim);
+                  searcher.setSimilarity(indexState.searchSimilarity);
                   return searcher;
                 }
               });
       restartReopenThread();
 
-      startSearcherPruningThread(indexState.globalState.shutdownNow);
+      startSearcherPruningThread(indexState.getGlobalState().getShutdownLatch());
       started = true;
     } finally {
       if (!started) {
@@ -739,6 +793,7 @@ public class ShardState implements Closeable {
             indexDir,
             taxoDir);
         writer = null;
+        slm = new SearcherLifetimeManager();
       }
     }
   }
@@ -761,13 +816,14 @@ public class ShardState implements Closeable {
   }
 
   public SortedSetDocValuesReaderState getSSDVState(
-      SearcherTaxonomyManager.SearcherAndTaxonomy s, FieldDef fd) throws IOException {
-    return getSSDVStateForReader(s.searcher.getIndexReader(), fd);
+      IndexState indexState, SearcherTaxonomyManager.SearcherAndTaxonomy s, FieldDef fd)
+      throws IOException {
+    return getSSDVStateForReader(indexState, s.searcher.getIndexReader(), fd);
   }
 
-  public SortedSetDocValuesReaderState getSSDVStateForReader(IndexReader reader, FieldDef fd)
-      throws IOException {
-    FacetsConfig.DimConfig dimConfig = indexState.facetsConfig.getDimConfig(fd.getName());
+  public SortedSetDocValuesReaderState getSSDVStateForReader(
+      IndexState indexState, IndexReader reader, FieldDef fd) throws IOException {
+    FacetsConfig.DimConfig dimConfig = indexState.getFacetsConfig().getDimConfig(fd.getName());
     IndexReader.CacheKey cacheKey = reader.getReaderCacheHelper().getKey();
     SortedSetDocValuesReaderState ssdvState;
     synchronized (ssdvStates) {
@@ -833,78 +889,35 @@ public class ShardState implements Closeable {
     return ssdvState;
   }
 
-  /* TODO: read remote state from s3 */
-  @VisibleForTesting
-  public static File remoteStateExists(Path basePath) {
-    File[] primaryGenDirs = basePath.toFile().listFiles(File::isDirectory);
-    File highestNumberedPrimaryGen = getHighestNumberedDir(primaryGenDirs);
-    if (highestNumberedPrimaryGen == null) {
-      return null;
-    }
-
-    File[] nrtVersions =
-        basePath
-            .resolve(Paths.get(highestNumberedPrimaryGen.getName()))
-            .toFile()
-            .listFiles(File::isDirectory);
-    File highestNumberVerion = getHighestNumberedDir(nrtVersions);
-    return highestNumberVerion;
-  }
-
-  @VisibleForTesting
-  private static File getHighestNumberedDir(File[] directories) {
-    if (directories.length == 0) {
-      return null;
-    }
-    File latestDir = directories[0];
-    int highestVersion = 0;
-    for (File directory : directories) {
-      int versionNum = Integer.valueOf(directory.getName());
-      if (versionNum > highestVersion) {
-        highestVersion = versionNum;
-        latestDir = directory;
-      }
-    }
-    return latestDir;
-  }
-
-  /** Start this index as replica, pulling NRT changes from the specified primary */
-  public synchronized void startReplica(
-      ReplicationServerClient primaryAddress, long primaryGen, Path dataPath) throws Exception {
+  /**
+   * Start this index as replica, pulling NRT changes from the specified primary.
+   *
+   * @param primaryAddress client to communicate with primary replication server
+   * @param primaryGen last primary generation, or -1 to detect from index
+   */
+  public synchronized void startReplica(ReplicationServerClient primaryAddress, long primaryGen)
+      throws IOException {
     if (isStarted()) {
       throw new IllegalStateException("index \"" + name + "\" was already started");
     }
-    // we have backups and are not creating a new index
-    // use that to load indexes and other state (registeredFields, settings)
-    if (!doCreate && dataPath != null) {
-      if (indexState.rootDir != null) {
-        synchronized (this) {
-          // copy downloaded data into rootDir
-          indexState.restoreDir(dataPath, indexState.rootDir);
-        }
-        indexState.initSaveLoadState();
-      }
-    }
+    IndexState indexState = indexStateManager.getCurrent();
+    LuceneServerConfiguration configuration = indexState.getGlobalState().getConfiguration();
 
     // nocommit share code better w/ start and startPrimary!
     try {
-      if (indexState.saveLoadState == null) {
-        indexState.initSaveLoadState();
-      }
       Path indexDirFile;
       if (rootDir == null) {
         indexDirFile = null;
       } else {
-        indexDirFile = rootDir.resolve("index");
+        indexDirFile = rootDir.resolve(INDEX_DATA_DIR_NAME);
       }
       origIndexDir =
-          indexState.df.open(indexDirFile, indexState.globalState.configuration.getPreloadConfig());
+          indexState.getDirectoryFactory().open(indexDirFile, configuration.getPreloadConfig());
       // nocommit don't allow RAMDir
       // nocommit remove NRTCachingDir too?
       if ((origIndexDir instanceof MMapDirectory) == false) {
-        double maxMergeSizeMB =
-            indexState.getDoubleSetting("nrtCachingDirectoryMaxMergeSizeMB", 5.0);
-        double maxSizeMB = indexState.getDoubleSetting("nrtCachingDirectoryMaxSizeMB", 60.0);
+        double maxMergeSizeMB = indexState.getNrtCachingDirectoryMaxMergeSizeMB();
+        double maxSizeMB = indexState.getNrtCachingDirectoryMaxSizeMB();
         if (maxMergeSizeMB > 0 && maxSizeMB > 0) {
           indexDir = new NRTCachingDirectory(origIndexDir, maxMergeSizeMB, maxSizeMB);
         } else {
@@ -917,28 +930,36 @@ public class ShardState implements Closeable {
       manager = null;
       nrtPrimaryNode = null;
 
-      boolean verbose = indexState.globalState.configuration.getIndexVerbose();
+      boolean verbose = configuration.getIndexVerbose();
 
       HostPort hostPort =
           new HostPort(
-              indexState.globalState.getHostName(), indexState.globalState.getReplicationPort());
+              indexState.getGlobalState().getHostName(),
+              indexState.getGlobalState().getReplicationPort());
       nrtReplicaNode =
           new NRTReplicaNode(
-              indexState.name,
+              indexState.getName(),
               primaryAddress,
               hostPort,
               REPLICA_ID,
               indexDir,
               new ShardSearcherFactory(true, false),
               verbose ? System.out : new PrintStream(OutputStream.nullOutputStream()),
-              primaryGen,
-              indexState.globalState.configuration.getFileCopyConfig().getAckedCopy());
-
-      if (indexState.globalState.configuration.getSyncInitialNrtPoint()) {
-        nrtReplicaNode.syncFromCurrentPrimary(INITIAL_SYNC_PRIMARY_WAIT_MS);
+              configuration.getFileCopyConfig().getAckedCopy(),
+              configuration.getDecInitialCommit(),
+              configuration.getFilterIncompatibleSegmentReaders());
+      if (primaryGen != -1) {
+        nrtReplicaNode.start(primaryGen);
+      } else {
+        nrtReplicaNode.startWithLastPrimaryGen();
       }
 
-      startSearcherPruningThread(indexState.globalState.shutdownNow);
+      if (configuration.getSyncInitialNrtPoint()) {
+        nrtReplicaNode.syncFromCurrentPrimary(
+            configuration.getInitialSyncPrimaryWaitMs(), configuration.getInitialSyncMaxTimeMs());
+      }
+
+      startSearcherPruningThread(indexState.getGlobalState().getShutdownLatch());
 
       // Necessary so that the replica "hang onto" all versions sent to it, since the version is
       // sent back to the user on writeNRTPoint
@@ -960,9 +981,13 @@ public class ShardState implements Closeable {
       keepAlive = new KeepAlive(this);
       new Thread(keepAlive, "KeepAlive").start();
 
-      WarmerConfig warmerConfig = indexState.globalState.configuration.getWarmerConfig();
+      WarmerConfig warmerConfig = configuration.getWarmerConfig();
       if (warmerConfig.isWarmOnStartup() && indexState.getWarmer() != null) {
-        indexState.getWarmer().warmFromS3(indexState, warmerConfig.getWarmingParallelism());
+        try {
+          indexState.getWarmer().warmFromS3(indexState, warmerConfig.getWarmingParallelism());
+        } catch (SearchHandlerException | InterruptedException e) {
+          throw new RuntimeException(e);
+        }
       }
       started = true;
     } finally {
@@ -977,6 +1002,7 @@ public class ShardState implements Closeable {
             indexDir,
             taxoDir);
         writer = null;
+        slm = new SearcherLifetimeManager();
       }
     }
   }
@@ -1018,86 +1044,6 @@ public class ShardState implements Closeable {
     }
   }
 
-  /** Context to hold state for a single indexing request. */
-  public static class IndexingContext {
-
-    /** How many chunks are still indexing. */
-    public final Phaser inFlightChunks = new Phaser();
-
-    /** How many documents were added. */
-    public final AtomicInteger addCount = new AtomicInteger();
-
-    /** Any indexing errors that occurred. */
-    public final AtomicReference<Throwable> error = new AtomicReference<>();
-
-    /** Sole constructor. */
-    public IndexingContext() {}
-
-    /** Only keeps the first error seen, and all bulk indexing stops after this. */
-    public void setError(Throwable t) {
-      // System.out.println("IndexingContext.setError:");
-      // t.printStackTrace(System.out);
-      error.compareAndSet(null, t);
-    }
-
-    /** Returns the first exception hit while indexing, or null */
-    public Throwable getError() {
-      return error.get();
-    }
-  }
-
-  /** Job for a single block addDocuments call. */
-  class AddDocumentsJob implements Callable<Long> {
-    private final Term updateTerm;
-    private final Iterable<Document> docs;
-    private final IndexingContext ctx;
-
-    // Position of this document in the bulk request:
-    private final int index;
-
-    /** Sole constructor. */
-    public AddDocumentsJob(
-        int index, Term updateTerm, Iterable<Document> docs, IndexingContext ctx) {
-      this.updateTerm = updateTerm;
-      this.docs = docs;
-      this.ctx = ctx;
-      this.index = index;
-    }
-
-    @Override
-    public Long call() throws Exception {
-      long gen = -1;
-      try {
-        Iterable<Document> justDocs;
-        if (indexState.hasFacets()) {
-          List<Document> justDocsList = new ArrayList<Document>();
-          for (Document doc : docs) {
-            // Translate any FacetFields:
-            justDocsList.add(indexState.facetsConfig.build(taxoWriter, doc));
-          }
-          justDocs = justDocsList;
-        } else {
-          justDocs = docs;
-        }
-
-        // System.out.println(Thread.currentThread().getName() + ": add; " + docs);
-        if (updateTerm == null) {
-          gen = writer.addDocuments(justDocs);
-        } else {
-          gen = writer.updateDocuments(updateTerm, justDocs);
-        }
-      } catch (Exception e) {
-        ctx.setError(new RuntimeException("error while indexing document " + index, e));
-      } finally {
-        ctx.addCount.incrementAndGet();
-        // TODO: Semaphore to be acquired before submitting a job on its own thread
-        // indexState.globalState.indexingJobsRunning.release();
-      }
-
-      return gen;
-    }
-  }
-
   public static class KeepAlive implements Runnable, Closeable {
     private static final Logger logger = LoggerFactory.getLogger(KeepAlive.class);
     private volatile boolean exit = false;
@@ -1107,7 +1053,11 @@ public class ShardState implements Closeable {
     KeepAlive(ShardState shardState) {
       this.shardState = shardState;
       this.pingIntervalMs =
-          shardState.indexState.globalState.getReplicaReplicationPortPingInterval();
+          shardState
+              .indexStateManager
+              .getCurrent()
+              .getGlobalState()
+              .getReplicaReplicationPortPingInterval();
     }
 
     @Override
@@ -1123,7 +1073,7 @@ public class ShardState implements Closeable {
             nrtReplicaNode
                 .getPrimaryAddress()
                 .addReplicas(
-                    shardState.indexState.name,
+                    shardState.indexStateManager.getCurrent().getName(),
                     REPLICA_ID,
                     nrtReplicaNode.getHostPort().getHostName(),
                     nrtReplicaNode.getHostPort().getPort());
@@ -1133,11 +1083,10 @@ public class ShardState implements Closeable {
         } catch (StatusRuntimeException e) {
           logger.warn(
               String.format(
-                  "Replica host: %s, binary port: %s cannot reach primary host: %s replication port: %s",
+                  "Replica host: %s, binary port: %s cannot reach primary: %s",
                   nrtReplicaNode.getHostPort().getHostName(),
                   nrtReplicaNode.getHostPort().getPort(),
-                  nrtReplicaNode.getPrimaryAddress().getHost(),
-                  nrtReplicaNode.getPrimaryAddress().getPort()));
+                  nrtReplicaNode.getPrimaryAddress()));
         }
       }
     }

@@ -30,7 +30,7 @@ public class RecvCopyStateHandler implements Handler<CopyStateRequest, CopyState
     ShardState shardState = indexState.getShard(0);
     if (shardState.isPrimary() == false) {
       throw new IllegalArgumentException(
-          "index \"" + indexState.name + "\" was not started or is not a primary");
+          "index \"" + indexState.getName() + "\" was not started or is not a primary");
     }
 
     if (!isValidMagicHeader(copyStateRequest.getMagicNumber())) {
@@ -80,8 +80,7 @@ public class RecvCopyStateHandler implements Handler<CopyStateRequest, CopyState
     return builder.build();
   }
 
-  public static FilesMetadata writeFilesMetaData(Map<String, FileMetaData> files)
-      throws IOException {
+  public static FilesMetadata writeFilesMetaData(Map<String, FileMetaData> files) {
     FilesMetadata.Builder builder = FilesMetadata.newBuilder();
     builder.setNumFiles(files.size());
 

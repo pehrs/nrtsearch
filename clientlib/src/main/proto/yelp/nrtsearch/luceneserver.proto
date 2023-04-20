@@ -9,6 +9,7 @@ import "google/api/httpbody.proto";
 import "google/protobuf/any.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
 
 
 option java_multiple_files = true;
@@ -36,6 +37,18 @@ service LuceneServer {
       post: "/v1/live_settings"
       body: "*"
     };
+
+    }
+
+    /* Change global offline or online settings for this index. */
+    rpc liveSettingsV2 (LiveSettingsV2Request) returns (LiveSettingsV2Response) {
+        option (google.api.http) = {
+            post: "/v2/live_settings"
+            body: "*"
+            additional_bindings {
+                get: "/v2/live_settings/{indexName}"
+            }
+        };
 
     }
     /* Registers one or more fields.  Fields must be registered before they can be added in a document (via @addDocument).
@@ -71,6 +84,20 @@ service LuceneServer {
     };
 
     }
+
+    /* Change global offline settings for this index.
+    This returns the currently set settings; pass no settings to retrieve current settings.*/
+    rpc settingsV2 (SettingsV2Request) returns (SettingsV2Response) {
+        option (google.api.http) = {
+            post: "/v2/settings"
+            body: "*"
+            additional_bindings {
+                get: "/v2/settings/{indexName}"
+            }
+        };
+
+    }
+
     /* Starts an index */
     rpc startIndex (StartIndexRequest) returns (StartIndexResponse) {
         option (google.api.http) = {
@@ -79,10 +106,27 @@ service LuceneServer {
     };
 
     }
+
+    /* Starts an index using configuration in IndexStartConfig */
+    rpc startIndexV2 (StartIndexV2Request) returns (StartIndexResponse) {
+        option (google.api.http) = {
+            post: "/v2/start_index"
+            body: "*"
+        };
+    }
+
     /* Stops an index */
     rpc stopIndex (StopIndexRequest) returns (DummyResponse) {
         option (google.api.http) = {
       post: "/v1/stop_index"
+      body: "*"
+    };
+
+    }
+    /* Reload state from the backend */
+    rpc reloadState (ReloadStateRequest) returns (ReloadStateResponse) {
+        option (google.api.http) = {
+      post: "/v1/reload_state"
       body: "*"
     };
 
@@ -334,6 +378,16 @@ service LuceneServer {
       body: "*"
     };
     }
+
+    /*
+    Process request in a plugin which implements CustomRequestPlugin interface.
+    */
+    rpc custom(CustomRequest) returns (CustomResponse) {
+        option (google.api.http) = {
+            post: "/v1/custom/{id}/{path}"
+            body: "*"
+        };
+    }
 }
 
 //The ReplicationServer service definition.
@@ -373,6 +427,16 @@ service ReplicationServer {
 /* Input to createIndex */
 message CreateIndexRequest {
     string indexName = 1; // name of the index to be created. [a-zA-Z0-9]*
+    // Set if state/data already exists in the data backend. Provides the UUID to identify and load the index.
+    string existsWithId = 2;
+    // Optional initial index settings
+    IndexSettings settings = 3;
+    // Optional initial index live settings
+    IndexLiveSettings liveSettings = 4;
+    // Optional initial index fields
+    repeated Field fields = 5;
+    // If this index should also be started, using IndexStartConfig configuration
+    bool start = 6;
 }
 
 /* Response from Server to createIndex */
@@ -416,6 +480,18 @@ message LiveSettingsResponse {
     string response = 1;
 }
 
+message LiveSettingsV2Request {
+    // Index name
+    string indexName = 1;
+    // Live settings to merge into existing live settings, or unset to get current live settings
+    IndexLiveSettings liveSettings = 2;
+}
+
+message LiveSettingsV2Response {
+    // Current live settings, including default values
+    IndexLiveSettings liveSettings = 1;
+}
+
 //Type of the field
 enum FieldType {
     ATOM = 0; // Text that's indexed as a single token, with DOCS_ONLY and omitting norms.
@@ -435,6 +511,9 @@ enum FieldType {
     _ID = 12; // Field which will be used as document IDs
     POLYGON = 13; // Geojson string for polygon
     OBJECT = 14; // JSON
+    // List of float values
+    VECTOR = 15;
+    CONTEXT_SUGGEST = 16; //Field used for contextual suggest fields
 }
 
 //How the tokens should be indexed.
@@ -473,7 +552,7 @@ message Field {
     bool tokenize = 7; // True if the value should be tokenized.
     bool group = 8; // True if the value should be indexed into doc values for grouping.
     bool multiValued = 9; // True if this field may sometimes have more than one value.
-    bool highlight = 10; // True if the value should be indexed for highlighting.
+    bool highlight = 10 [deprecated = true]; // This parameter would be ignored
     bool omitNorms = 11; // True if norms are omitted.
     string dateTimeFormat = 12; // Format string used to parse datetime fields, supported values are: 1) DateTimeFormatter format 2) "epoch_millis" (datetime value is epoch timestamp)
     string postingsFormat = 13; // Which PostingsFormat should be used to index this field.
@@ -495,6 +574,9 @@ message Field {
 
     bool eagerGlobalOrdinals = 27; // Compute facet global ordinals for this field up front, otherwise this is done lazily on first query. Currently only for SORTED_SET_DOC_VALUES facet type.
     bool nestedDoc = 28; // True if object data should be indexed as child documents
+    int32 vectorDimensions = 29; // Dimensions for vector field type
+    // If field based global ordinals should be built up front, otherwise this is done lazily on first access. Currently only for fields with text doc values (TEXT/ATOM).
+    bool eagerFieldGlobalOrdinals = 30;
 }
 
 /* Input to registerFields */
@@ -530,6 +612,18 @@ message SettingsResponse {
     string response = 1;
 }
 
+message SettingsV2Request {
+    // Index name
+    string indexName = 1;
+    // Settings to merge into existing settings, or unset to get current settings
+    IndexSettings settings = 2;
+}
+
+message SettingsV2Response {
+    // Current index settings, including default values
+    IndexSettings settings = 1;
+}
+
 /* Start the index */
 message StartIndexRequest {
     string indexName = 1; //index name
@@ -538,6 +632,14 @@ message StartIndexRequest {
     string primaryAddress = 4; //replica, the IP address or host name of the remote primary
     int32 port = 5; //replica, the TCP port of the remote primary
     RestoreIndex restore = 6; // restore index from backup
+    // replica, location of discovery file containing primary host/port. Used if primaryAddress is empty. If port is specified in this request, it overrides the value in the file
+    string primaryDiscoveryFile = 7;
+}
+
+/* Start the index using IndexStartConfig configuration */
+message StartIndexV2Request {
+    // index name
+    string indexName = 1;
 }
 
 enum Mode {
@@ -583,7 +685,7 @@ message RefreshResponse {
 }
 
 message CommitRequest {
-    string indexName = 1; //index to commit
+  string indexName = 1; //index to commit
 }
 
 message CommitResponse {
@@ -655,6 +757,12 @@ message DummyResponse {
 
 message StopIndexRequest {
     string indexName = 1; //index name to stop
+}
+
+message ReloadStateRequest {
+}
+
+message ReloadStateResponse {
 }
 
 /*
@@ -932,4 +1040,92 @@ message ForceMergeDeletesResponse {
         FORCE_MERGE_DELETES_SUBMITTED = 1;
     }
     Status status = 1;
+}
+
+message IndexSettings {
+    // Largest merged segment size to cache in RAMDirectory, default: 5.0MB
+    google.protobuf.DoubleValue nrtCachingDirectoryMaxMergeSizeMB = 1;
+    // Largest overall size for all files cached in NRTCachingDirectory, default: 60.0MB
+    google.protobuf.DoubleValue nrtCachingDirectoryMaxSizeMB = 2;
+    // How many merge threads to allow at once
+    google.protobuf.Int32Value concurrentMergeSchedulerMaxThreadCount = 3;
+    // Maximum backlog of pending merges before indexing threads are stalled
+    google.protobuf.Int32Value concurrentMergeSchedulerMaxMergeCount = 4;
+    // Index time sorting; can only be written once", SearchHandler.SORT_TYPE
+    SortFields indexSort = 5;
+    // Turn on/off the merge scheduler's auto throttling, default: off
+    google.protobuf.BoolValue indexMergeSchedulerAutoThrottle = 6;
+    // Base Directory implementation to use (NRTCachingDirectory will wrap this) either one of the core implementations (FSDirectory, MMapDirectory, NIOFSDirectory, SimpleFSDirectory, RAMDirectory (for temporary indices!) or a fully qualified path to a Directory implementation that has a public constructor taking a single File argument default: FSDirectory
+    google.protobuf.StringValue directory = 7;
+
+}
+
+message IndexLiveSettings {
+    // Longest time to wait before reopening IndexSearcher (i.e., periodic background reopen), default: 1.0
+    google.protobuf.DoubleValue maxRefreshSec = 1;
+    // Shortest time to wait before reopening IndexSearcher (i.e., when a search is waiting for a specific indexGen), default: 0.05
+    google.protobuf.DoubleValue minRefreshSec = 2;
+    // Non-current searchers older than this are pruned, default: 60.0
+    google.protobuf.DoubleValue maxSearcherAgeSec = 3;
+    // Size (in MB) of IndexWriter's RAM buffer, default: 16.0
+    google.protobuf.DoubleValue indexRamBufferSizeMB = 4;
+    // Max number of documents to add at a time, default: 100
+    google.protobuf.Int32Value addDocumentsMaxBufferLen = 5;
+    // Maximum number of documents allowed in a parallel search slice, default: 250,000
+    google.protobuf.Int32Value sliceMaxDocs = 6;
+    // Maximum number of segments allowed in a parallel search slice, default: 5
+    google.protobuf.Int32Value sliceMaxSegments = 7;
+    // Number of virtual shards to use for this index, default: 1
+    google.protobuf.Int32Value virtualShards = 8;
+    // Maximum sized segment to produce during normal merging, default: 5GB
+    google.protobuf.Int32Value maxMergedSegmentMB = 9;
+    // Number of segments per tier used by TieredMergePolicy, default: 10
+    google.protobuf.Int32Value segmentsPerTier = 10;
+    // Timeout value to used when not specified in the search request, or 0 for no timeout, default: 0
+    google.protobuf.DoubleValue defaultSearchTimeoutSec = 11;
+    // Timeout check every value to use when not specified in the search request, or 0 for none, default: 0
+    google.protobuf.Int32Value defaultSearchTimeoutCheckEvery = 12;
+    // Terminate after value to use when not specified in the search request, or 0 for none, default: 0
+    google.protobuf.Int32Value defaultTerminateAfter = 13;
+    // Merge precopy would be stopped after this time, or 0 for no checks, default: 0
+    google.protobuf.UInt64Value maxMergePreCopyDurationSec = 14;
+}
+
+message IndexStateInfo {
+    // Name of the index
+    string indexName = 1;
+    // State version generation
+    int64 gen = 2;
+    // If this index has ever been committed
+    bool committed = 3;
+    // Index settings
+    IndexSettings settings = 4;
+    // Index live settings
+    IndexLiveSettings liveSettings = 5;
+    // Registered fields
+    map<string, Field> fields = 6;
+}
+
+message IndexGlobalState {
+    // Unique identifier for index (UUID)
+    string id = 1;
+    // If index should be started
+    bool started = 2;
+}
+
+message GlobalStateInfo {
+    // State version generation
+    int64 gen = 1;
+    // Global state for indices
+    map<string, IndexGlobalState> indices = 2;
+}
+
+message CustomRequest {
+    string id = 1; // ID defined for custom requests in a plugin
+    string path = 2; // Custom path that is defined in a plugin that maps to a route
+    map<string, string> params = 3; // Parameters that can be processed by the plugin at the specified path
+}
+
+message CustomResponse {
+    map<string, string> response = 1; // Custom response sent by the plugin
 }

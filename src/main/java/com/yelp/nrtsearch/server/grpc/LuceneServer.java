@@ -18,6 +18,7 @@ package com.yelp.nrtsearch.server.grpc;
 import static com.yelp.nrtsearch.server.grpc.ReplicationServerClient.MAX_MESSAGE_BYTES_SIZE;
 
 import com.google.api.HttpBody;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
@@ -25,6 +26,7 @@ import com.google.common.collect.Sets;
 import com.google.inject.Guice;
 import com.google.inject.Inject;
 import com.google.inject.Injector;
+import com.google.inject.name.Named;
 import com.google.protobuf.Any;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
@@ -34,29 +36,39 @@ import com.yelp.nrtsearch.GCSLuceneServerModule;
 import com.yelp.nrtsearch.LuceneServerModule;
 import com.yelp.nrtsearch.S3LuceneServerModule;
 import com.yelp.nrtsearch.server.MetricsRequestHandler;
+import com.yelp.nrtsearch.server.backup.Archiver;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
 import com.yelp.nrtsearch.server.config.QueryCacheConfig;
 import com.yelp.nrtsearch.server.luceneserver.*;
 import com.yelp.nrtsearch.server.luceneserver.AddDocumentHandler.DocumentIndexer;
 import com.yelp.nrtsearch.server.luceneserver.analysis.AnalyzerCreator;
+import com.yelp.nrtsearch.server.luceneserver.custom.request.CustomRequestProcessor;
 import com.yelp.nrtsearch.server.luceneserver.field.FieldDefCreator;
+import com.yelp.nrtsearch.server.luceneserver.index.IndexStateManager;
+import com.yelp.nrtsearch.server.luceneserver.index.handlers.FieldUpdateHandler;
+import com.yelp.nrtsearch.server.luceneserver.index.handlers.LiveSettingsV2Handler;
+import com.yelp.nrtsearch.server.luceneserver.index.handlers.SettingsV2Handler;
 import com.yelp.nrtsearch.server.luceneserver.rescore.RescorerCreator;
 import com.yelp.nrtsearch.server.luceneserver.script.ScriptService;
 import com.yelp.nrtsearch.server.luceneserver.search.FetchTaskCreator;
+import com.yelp.nrtsearch.server.luceneserver.search.cache.NrtQueryCache;
+import com.yelp.nrtsearch.server.luceneserver.search.collectors.CollectorCreator;
 import com.yelp.nrtsearch.server.luceneserver.similarity.SimilarityCreator;
 import com.yelp.nrtsearch.server.luceneserver.warming.Warmer;
 import com.yelp.nrtsearch.server.monitoring.*;
 import com.yelp.nrtsearch.server.monitoring.ThreadPoolCollector.RejectionCounterWrapper;
 import com.yelp.nrtsearch.server.plugins.Plugin;
 import com.yelp.nrtsearch.server.plugins.PluginsService;
-import com.yelp.nrtsearch.server.utils.Archiver;
 import com.yelp.nrtsearch.server.utils.ThreadPoolExecutorFactory;
+import io.grpc.Context;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.ServerInterceptors;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.protobuf.services.ProtoReflectionService;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import io.prometheus.client.CollectorRegistry;
 import io.prometheus.client.hotspot.DefaultExports;
@@ -69,7 +81,8 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.LRUQueryCache;
+import org.apache.lucene.search.QueryCache;
+import org.apache.lucene.search.suggest.document.CompletionPostingsFormatUtil;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.slf4j.Logger;
@@ -81,73 +94,38 @@ public class LuceneServer {
   private static final Logger logger = LoggerFactory.getLogger(LuceneServer.class.getName());
   private static final Splitter COMMA_SPLITTER = Splitter.on(",");
   private final Archiver archiver;
+  private final Archiver incArchiver;
   private final CollectorRegistry collectorRegistry;
   private final PluginsService pluginsService;
 
   private Server server;
   private Server replicationServer;
-  private LuceneServerConfiguration luceneServerConfiguration;
+  private final LuceneServerConfiguration luceneServerConfiguration;
 
   @Inject
   public LuceneServer(
       LuceneServerConfiguration luceneServerConfiguration,
-      Archiver archiver,
+      @Named("legacyArchiver") Archiver archiver,
+      @Named("incArchiver") Archiver incArchiver,
       CollectorRegistry collectorRegistry) {
     this.luceneServerConfiguration = luceneServerConfiguration;
     this.archiver = archiver;
+    this.incArchiver = incArchiver;
     this.collectorRegistry = collectorRegistry;
-    this.pluginsService = new PluginsService(luceneServerConfiguration);
+    this.pluginsService = new PluginsService(luceneServerConfiguration, collectorRegistry);
   }
 
   private void start() throws IOException {
-    GlobalState globalState = new GlobalState(luceneServerConfiguration);
-
-    registerMetrics();
-
     List<Plugin> plugins = pluginsService.loadPlugins();
-
     String serviceName = luceneServerConfiguration.getServiceName();
     String nodeName = luceneServerConfiguration.getNodeName();
 
-    if (luceneServerConfiguration.getRestoreState()) {
-      logger.info("Loading state for any previously backed up indexes");
-      List<String> indexes =
-          RestoreStateHandler.restore(
-              archiver, globalState, luceneServerConfiguration.getServiceName());
-      for (String index : indexes) {
-        logger.info("Loaded state for index " + index);
-      }
-    }
+    LuceneServerImpl serverImpl =
+        new LuceneServerImpl(
+            luceneServerConfiguration, archiver, incArchiver, collectorRegistry, plugins);
+    GlobalState globalState = serverImpl.getGlobalState();
 
-    LuceneServerMonitoringServerInterceptor monitoringInterceptor =
-        LuceneServerMonitoringServerInterceptor.create(
-            Configuration.allMetrics()
-                .withLatencyBuckets(luceneServerConfiguration.getMetricsBuckets())
-                .withCollectorRegistry(collectorRegistry),
-            serviceName,
-            nodeName);
-    /* The port on which the server should run */
-    server =
-        ServerBuilder.forPort(luceneServerConfiguration.getPort())
-            .addService(
-                ServerInterceptors.intercept(
-                    new LuceneServerImpl(
-                        globalState,
-                        luceneServerConfiguration,
-                        archiver,
-                        collectorRegistry,
-                        plugins),
-                    monitoringInterceptor))
-            .addService(ProtoReflectionService.newInstance())
-            .executor(
-                ThreadPoolExecutorFactory.getThreadPoolExecutor(
-                    ThreadPoolExecutorFactory.ExecutorType.LUCENESERVER,
-                    luceneServerConfiguration.getThreadPoolConfiguration()))
-            .maxInboundMessageSize(MAX_MESSAGE_BYTES_SIZE)
-            .build()
-            .start();
-    logger.info(
-        "Server started, listening on " + luceneServerConfiguration.getPort() + " for messages");
+    registerMetrics(globalState);
 
     if (luceneServerConfiguration.getMaxConcurrentCallsPerConnectionForReplication() != -1) {
       replicationServer =
@@ -179,11 +157,37 @@ public class LuceneServer {
               .build()
               .start();
     }
-
     logger.info(
         "Server started, listening on "
             + luceneServerConfiguration.getReplicationPort()
             + " for replication messages");
+
+    // Inform global state that the replication server is started, and it is safe to start indices
+    globalState.replicationStarted(replicationServer.getPort());
+
+    LuceneServerMonitoringServerInterceptor monitoringInterceptor =
+        LuceneServerMonitoringServerInterceptor.create(
+            Configuration.allMetrics()
+                .withLatencyBuckets(luceneServerConfiguration.getMetricsBuckets())
+                .withCollectorRegistry(collectorRegistry),
+            serviceName,
+            nodeName);
+    /* The port on which the server should run */
+    server =
+        ServerBuilder.forPort(luceneServerConfiguration.getPort())
+            .addService(ServerInterceptors.intercept(serverImpl, monitoringInterceptor))
+            .addService(ProtoReflectionService.newInstance())
+            .executor(
+                ThreadPoolExecutorFactory.getThreadPoolExecutor(
+                    ThreadPoolExecutorFactory.ExecutorType.LUCENESERVER,
+                    luceneServerConfiguration.getThreadPoolConfiguration()))
+            .maxInboundMessageSize(MAX_MESSAGE_BYTES_SIZE)
+            .compressorRegistry(LuceneServerStubBuilder.COMPRESSOR_REGISTRY)
+            .decompressorRegistry(LuceneServerStubBuilder.DECOMPRESSOR_REGISTRY)
+            .build()
+            .start();
+    logger.info(
+        "Server started, listening on " + luceneServerConfiguration.getPort() + " for messages");
 
     Runtime.getRuntime()
         .addShutdownHook(
@@ -219,7 +223,7 @@ public class LuceneServer {
   }
 
   /** Register prometheus metrics exposed by /status/metrics */
-  private void registerMetrics() {
+  private void registerMetrics(GlobalState globalState) {
     // register jvm metrics
     if (luceneServerConfiguration.getPublishJvmMetrics()) {
       DefaultExports.register(collectorRegistry);
@@ -233,6 +237,10 @@ public class LuceneServer {
     IndexMetrics.register(collectorRegistry);
     // register query cache metrics
     new QueryCacheCollector().register(collectorRegistry);
+    // register deadline cancellation metrics
+    DeadlineMetrics.register(collectorRegistry);
+    // register directory size metrics
+    new DirSizeCollector(globalState).register(collectorRegistry);
   }
 
   /** Main launches the server from the command line. */
@@ -266,9 +274,15 @@ public class LuceneServer {
 
     @Override
     public Integer call() throws Exception {
-      Injector injector = createInjector();
-      LuceneServer luceneServer = injector.getInstance(LuceneServer.class);
-      luceneServer.start();
+      LuceneServer luceneServer;
+      try {
+        Injector injector = createInjector();
+        luceneServer = injector.getInstance(LuceneServer.class);
+        luceneServer.start();
+      } catch (Throwable t) {
+        logger.error("Uncaught exception", t);
+        throw t;
+      }
       luceneServer.blockUntilShutdown();
       return 0;
     }
@@ -277,6 +291,7 @@ public class LuceneServer {
       if(this.useGCS) {
         return Guice.createInjector(new GCSLuceneServerModule(this));
       } else {
+        // Guice.createInjector(new LuceneServerModule(this));
         return Guice.createInjector(new S3LuceneServerModule(this));
       }
     }
@@ -287,40 +302,67 @@ public class LuceneServer {
         JsonFormat.printer().omittingInsignificantWhitespace();
     private final GlobalState globalState;
     private final Archiver archiver;
+    private final Archiver incArchiver;
     private final CollectorRegistry collectorRegistry;
     private final ThreadPoolExecutor searchThreadPoolExecutor;
     private final String archiveDirectory;
+    private final boolean backupFromIncArchiver;
 
+    /**
+     * Constructor used with newer state handling. Defers initialization of global state until after
+     * extendable components.
+     *
+     * @param configuration server configuration
+     * @param archiver archiver for external file transfer
+     * @param incArchiver archiver for incremental index data copy
+     * @param collectorRegistry metrics collector registry
+     * @param plugins loaded plugins
+     * @throws IOException
+     */
     LuceneServerImpl(
-        GlobalState globalState,
         LuceneServerConfiguration configuration,
         Archiver archiver,
+        Archiver incArchiver,
         CollectorRegistry collectorRegistry,
-        List<Plugin> plugins) {
-      this.globalState = globalState;
+        List<Plugin> plugins)
+        throws IOException {
       this.archiver = archiver;
+      this.incArchiver = incArchiver;
       this.archiveDirectory = configuration.getArchiveDirectory();
       this.collectorRegistry = collectorRegistry;
-      this.searchThreadPoolExecutor = globalState.getSearchThreadPoolExecutor();
+      this.backupFromIncArchiver = configuration.getBackupWithInArchiver();
+
+      DeadlineUtils.setCancellationEnabled(configuration.getDeadlineCancellation());
+      CompletionPostingsFormatUtil.setCompletionCodecLoadMode(
+          configuration.getCompletionCodecLoadMode());
 
       initQueryCache(configuration);
       initExtendableComponents(configuration, plugins);
+
+      this.globalState = GlobalState.createState(configuration, incArchiver, archiver);
+      this.searchThreadPoolExecutor = globalState.getSearchThreadPoolExecutor();
     }
 
-    private void initQueryCache(LuceneServerConfiguration configuration) {
+    @VisibleForTesting
+    static void initQueryCache(LuceneServerConfiguration configuration) {
       QueryCacheConfig cacheConfig = configuration.getQueryCacheConfig();
-      LRUQueryCache queryCache =
-          new LRUQueryCache(
-              cacheConfig.getMaxQueries(),
-              cacheConfig.getMaxMemoryBytes(),
-              cacheConfig.getLeafPredicate(),
-              cacheConfig.getSkipCacheFactor());
+      QueryCache queryCache = null;
+      if (cacheConfig.getEnabled()) {
+        queryCache =
+            new NrtQueryCache(
+                cacheConfig.getMaxQueries(),
+                cacheConfig.getMaxMemoryBytes(),
+                cacheConfig.getLeafPredicate(),
+                cacheConfig.getSkipCacheFactor());
+      }
       IndexSearcher.setDefaultQueryCache(queryCache);
     }
 
     private void initExtendableComponents(
         LuceneServerConfiguration configuration, List<Plugin> plugins) {
       AnalyzerCreator.initialize(configuration, plugins);
+      CollectorCreator.initialize(configuration, plugins);
+      CustomRequestProcessor.initialize(configuration, plugins);
       FetchTaskCreator.initialize(configuration, plugins);
       FieldDefCreator.initialize(configuration, plugins);
       RescorerCreator.initialize(configuration, plugins);
@@ -328,9 +370,37 @@ public class LuceneServer {
       SimilarityCreator.initialize(configuration, plugins);
     }
 
+    /** Get the global cluster state. */
+    public GlobalState getGlobalState() {
+      return globalState;
+    }
+
+    /**
+     * Set response compression on the provided {@link StreamObserver}. Should be a valid
+     * compression type from the {@link LuceneServerStubBuilder#COMPRESSOR_REGISTRY}, or empty
+     * string for default. Falls back to uncompressed on any error.
+     *
+     * @param compressionType compression type, or empty string
+     * @param responseObserver observer to set compression on
+     */
+    private void setResponseCompression(
+        String compressionType, StreamObserver<?> responseObserver) {
+      if (!compressionType.isEmpty()) {
+        try {
+          ServerCallStreamObserver<?> serverCallStreamObserver =
+              (ServerCallStreamObserver<?>) responseObserver;
+          serverCallStreamObserver.setCompression(compressionType);
+        } catch (Exception e) {
+          logger.warn(
+              "Unable to set response compression to type '" + compressionType + "' : " + e);
+        }
+      }
+    }
+
     @Override
     public void createIndex(
         CreateIndexRequest req, StreamObserver<CreateIndexResponse> responseObserver) {
+      logger.info("Received create index request: {}", req);
       String indexName = req.getIndexName();
       String validIndexNameRegex = "[A-z0-9_-]+";
       if (!indexName.matches(validIndexNameRegex)) {
@@ -344,11 +414,7 @@ public class LuceneServer {
       }
 
       try {
-        IndexState indexState = globalState.createIndex(indexName);
-        // Create the first shard
-        logger.info("NOW ADD SHARD 0");
-        indexState.addShard(0, true);
-        logger.info("DONE ADD SHARD 0");
+        IndexState indexState = globalState.createIndex(req);
         String response = String.format("Created Index name: %s", indexName);
         CreateIndexResponse reply = CreateIndexResponse.newBuilder().setResponse(response).build();
         responseObserver.onNext(reply);
@@ -363,18 +429,11 @@ public class LuceneServer {
                 .asRuntimeException());
       } catch (Exception e) {
         logger.warn(
-            "error while trying to save index state to disk for indexName: "
-                + indexName
-                + "at rootDir: "
-                + globalState.getIndexDir(indexName),
-            e);
+            "error while trying to save index state to disk for indexName: " + indexName, e);
         responseObserver.onError(
             Status.INTERNAL
                 .withDescription(
-                    "error while trying to save index state to disk for indexName: "
-                        + indexName
-                        + "at rootDir: "
-                        + globalState.getIndexDir(indexName))
+                    "error while trying to save index state to disk for indexName: " + indexName)
                 .augmentDescription(e.getMessage())
                 .withCause(e)
                 .asRuntimeException());
@@ -384,6 +443,7 @@ public class LuceneServer {
     @Override
     public void liveSettings(
         LiveSettingsRequest req, StreamObserver<LiveSettingsResponse> responseObserver) {
+      logger.info("Received live settings request: {}", req);
       try {
         IndexState indexState = globalState.getIndex(req.getIndexName());
         LiveSettingsResponse reply = new LiveSettingsHandler().handle(indexState, req);
@@ -414,12 +474,46 @@ public class LuceneServer {
     }
 
     @Override
+    public void liveSettingsV2(
+        LiveSettingsV2Request req, StreamObserver<LiveSettingsV2Response> responseObserver) {
+      logger.info("Received live settings V2 request: {}", req);
+      try {
+        IndexStateManager indexStateManager = globalState.getIndexStateManager(req.getIndexName());
+        LiveSettingsV2Response reply = LiveSettingsV2Handler.handle(indexStateManager, req);
+        logger.info("LiveSettingsV2Handler returned " + JsonFormat.printer().print(reply));
+        responseObserver.onNext(reply);
+        responseObserver.onCompleted();
+      } catch (IllegalArgumentException e) {
+        logger.warn("index: " + req.getIndexName() + " was not yet created", e);
+        responseObserver.onError(
+            Status.ALREADY_EXISTS
+                .withDescription("invalid indexName: " + req.getIndexName())
+                .augmentDescription("IllegalArgumentException()")
+                .withCause(e)
+                .asRuntimeException());
+      } catch (Exception e) {
+        logger.warn(
+            "error while trying to process live settings for indexName: " + req.getIndexName(), e);
+        responseObserver.onError(
+            Status.INTERNAL
+                .withDescription(
+                    "error while trying to process live settings for indexName: "
+                        + req.getIndexName())
+                .augmentDescription("Exception()")
+                .withCause(e)
+                .asRuntimeException());
+      }
+    }
+
+    @Override
     public void registerFields(
         FieldDefRequest fieldDefRequest, StreamObserver<FieldDefResponse> responseObserver) {
+      logger.info("Received register fields request: {}", fieldDefRequest);
       try {
-        IndexState indexState = globalState.getIndex(fieldDefRequest.getIndexName());
-        FieldDefResponse reply = new RegisterFieldsHandler().handle(indexState, fieldDefRequest);
-        logger.info("RegisterFieldsHandler registered fields " + reply.toString());
+        IndexStateManager indexStateManager =
+            globalState.getIndexStateManager(fieldDefRequest.getIndexName());
+        FieldDefResponse reply = FieldUpdateHandler.handle(indexStateManager, fieldDefRequest);
+        logger.info("RegisterFieldsHandler registered fields " + reply);
         responseObserver.onNext(reply);
         responseObserver.onCompleted();
       } catch (IOException e) {
@@ -451,10 +545,12 @@ public class LuceneServer {
     @Override
     public void updateFields(
         FieldDefRequest fieldDefRequest, StreamObserver<FieldDefResponse> responseObserver) {
+      logger.info("Received update fields request: {}", fieldDefRequest);
       try {
-        IndexState indexState = globalState.getIndex(fieldDefRequest.getIndexName());
-        FieldDefResponse reply = new UpdateFieldsHandler().handle(indexState, fieldDefRequest);
-        logger.info("UpdateFieldsHandler registered fields " + reply.toString());
+        IndexStateManager indexStateManager =
+            globalState.getIndexStateManager(fieldDefRequest.getIndexName());
+        FieldDefResponse reply = FieldUpdateHandler.handle(indexStateManager, fieldDefRequest);
+        logger.info("UpdateFieldsHandler registered fields " + reply);
         responseObserver.onNext(reply);
         responseObserver.onCompleted();
       } catch (IOException e) {
@@ -487,6 +583,7 @@ public class LuceneServer {
     @Override
     public void settings(
         SettingsRequest settingsRequest, StreamObserver<SettingsResponse> responseObserver) {
+      logger.info("Received settings request: {}", settingsRequest);
       try {
         IndexState indexState = globalState.getIndex(settingsRequest.getIndexName());
         SettingsResponse reply = new SettingsHandler().handle(indexState, settingsRequest);
@@ -521,14 +618,59 @@ public class LuceneServer {
     }
 
     @Override
+    public void settingsV2(
+        SettingsV2Request settingsRequest, StreamObserver<SettingsV2Response> responseObserver) {
+      logger.info("Received settings V2 request: {}", settingsRequest);
+      try {
+        IndexStateManager indexStateManager =
+            globalState.getIndexStateManager(settingsRequest.getIndexName());
+        SettingsV2Response reply = SettingsV2Handler.handle(indexStateManager, settingsRequest);
+        logger.info("SettingsV2Handler returned: " + JsonFormat.printer().print(reply));
+        responseObserver.onNext(reply);
+        responseObserver.onCompleted();
+      } catch (IOException e) {
+        logger.warn(
+            "error while trying to read index state dir for indexName: "
+                + settingsRequest.getIndexName(),
+            e);
+        responseObserver.onError(
+            Status.INTERNAL
+                .withDescription(
+                    "error while trying to read index state dir for indexName: "
+                        + settingsRequest.getIndexName())
+                .augmentDescription("IOException()")
+                .withCause(e)
+                .asRuntimeException());
+      } catch (Exception e) {
+        logger.warn(
+            "error while trying to update/get settings for index " + settingsRequest.getIndexName(),
+            e);
+        responseObserver.onError(
+            Status.INVALID_ARGUMENT
+                .withDescription(
+                    "error while trying to update/get settings for index: "
+                        + settingsRequest.getIndexName())
+                .augmentDescription(e.getMessage())
+                .asRuntimeException());
+      }
+    }
+
+    @Override
     public void startIndex(
         StartIndexRequest startIndexRequest, StreamObserver<StartIndexResponse> responseObserver) {
+      logger.info("Received start index request: {}", startIndexRequest);
+      if (startIndexRequest.getIndexName().isEmpty()) {
+        logger.warn("error while trying to start index with empty index name.");
+        responseObserver.onError(
+            Status.INVALID_ARGUMENT
+                .withDescription(
+                    String.format("error while trying to start index since indexName was empty."))
+                .asRuntimeException());
+        return;
+      }
       try {
-        IndexState indexState = null;
-        StartIndexHandler startIndexHandler = new StartIndexHandler(archiver, archiveDirectory);
-        indexState =
-            globalState.getIndex(startIndexRequest.getIndexName(), startIndexRequest.hasRestore());
-        StartIndexResponse reply = startIndexHandler.handle(indexState, startIndexRequest);
+        StartIndexResponse reply = globalState.startIndex(startIndexRequest);
+
         logger.info("StartIndexHandler returned " + reply.toString());
         responseObserver.onNext(reply);
         responseObserver.onCompleted();
@@ -558,29 +700,59 @@ public class LuceneServer {
     }
 
     @Override
+    public void startIndexV2(
+        StartIndexV2Request startIndexRequest,
+        StreamObserver<StartIndexResponse> responseObserver) {
+      logger.info("Received start index v2 request: {}", startIndexRequest);
+      try {
+        StartIndexResponse reply = globalState.startIndexV2(startIndexRequest);
+        logger.info("StartIndexV2Handler returned " + reply.toString());
+        responseObserver.onNext(reply);
+        responseObserver.onCompleted();
+      } catch (IOException e) {
+        logger.warn(
+            "error while trying to read index state dir for indexName: "
+                + startIndexRequest.getIndexName(),
+            e);
+        responseObserver.onError(
+            Status.INTERNAL
+                .withDescription(
+                    "error while trying to read index state dir for indexName: "
+                        + startIndexRequest.getIndexName())
+                .augmentDescription(e.getMessage())
+                .withCause(e)
+                .asRuntimeException());
+      } catch (Exception e) {
+        logger.warn("error while trying to start index " + startIndexRequest.getIndexName(), e);
+        responseObserver.onError(
+            Status.INVALID_ARGUMENT
+                .withDescription(
+                    "error while trying to start index: " + startIndexRequest.getIndexName())
+                .augmentDescription(e.getMessage())
+                .asRuntimeException());
+      }
+    }
+
+    @Override
     public StreamObserver<AddDocumentRequest> addDocuments(
         StreamObserver<AddDocumentResponse> responseObserver) {
 
-      return new StreamObserver<AddDocumentRequest>() {
+      return new StreamObserver<>() {
         Multimap<String, Future<Long>> futures = HashMultimap.create();
         // Map of {indexName: addDocumentRequestQueue}
         Map<String, ArrayBlockingQueue<AddDocumentRequest>> addDocumentRequestQueueMap =
             new ConcurrentHashMap<>();
         // Map of {indexName: count}
         Map<String, Long> countMap = new ConcurrentHashMap<>();
-        private static final int DEFAULT_MAX_BUFFER_LEN = 100;
 
         private int getAddDocumentsMaxBufferLen(String indexName) {
           try {
             return globalState.getIndex(indexName).getAddDocumentsMaxBufferLen();
           } catch (Exception e) {
-            logger.warn(
-                String.format(
-                    "error while trying to get addDocumentsMaxBufferLen from"
-                        + "liveSettings of index %s. Using DEFAULT_MAX_BUFFER_LEN %d.",
-                    indexName, DEFAULT_MAX_BUFFER_LEN),
-                e);
-            return DEFAULT_MAX_BUFFER_LEN;
+            String error =
+                String.format("Index %s does not exist, unable to add documents", indexName);
+            logger.error(error, e);
+            throw Status.INVALID_ARGUMENT.withDescription(error).withCause(e).asRuntimeException();
           }
         }
 
@@ -612,8 +784,13 @@ public class LuceneServer {
         @Override
         public void onNext(AddDocumentRequest addDocumentRequest) {
           String indexName = addDocumentRequest.getIndexName();
-          ArrayBlockingQueue<AddDocumentRequest> addDocumentRequestQueue =
-              getAddDocumentRequestQueue(indexName);
+          ArrayBlockingQueue<AddDocumentRequest> addDocumentRequestQueue;
+          try {
+            addDocumentRequestQueue = getAddDocumentRequestQueue(indexName);
+          } catch (Exception e) {
+            onError(e);
+            return;
+          }
           logger.debug(
               String.format(
                   "onNext, index: %s, addDocumentRequestQueue size: %s",
@@ -629,7 +806,7 @@ public class LuceneServer {
               List<AddDocumentRequest> addDocRequestList = new ArrayList<>(addDocumentRequestQueue);
               Future<Long> future =
                   globalState.submitIndexingTask(
-                      new DocumentIndexer(globalState, addDocRequestList));
+                      new DocumentIndexer(globalState, addDocRequestList, indexName));
               futures.put(indexName, future);
             } catch (Exception e) {
               responseObserver.onError(e);
@@ -665,7 +842,8 @@ public class LuceneServer {
               // multiple indices but avoids deadlocking if there aren't more threads than the
               // maximum
               // number of parallel addDocuments calls.
-              long gen = new DocumentIndexer(globalState, addDocRequestList).runIndexingJob();
+              long gen =
+                  new DocumentIndexer(globalState, addDocRequestList, indexName).runIndexingJob();
               if (gen > highestGen) {
                 highestGen = gen;
               }
@@ -783,47 +961,55 @@ public class LuceneServer {
         CommitRequest commitRequest, StreamObserver<CommitResponse> commitResponseStreamObserver) {
       try {
         globalState.submitIndexingTask(
-            () -> {
-              try {
-                IndexState indexState = globalState.getIndex(commitRequest.getIndexName());
-                long gen = indexState.commit();
-                CommitResponse reply =
-                    CommitResponse.newBuilder()
-                        .setGen(gen)
-                        .setPrimaryId(globalState.getEphemeralId())
-                        .build();
-                logger.debug(
-                    String.format(
-                        "CommitHandler committed to index: %s for sequenceId: %s",
-                        commitRequest.getIndexName(), gen));
-                commitResponseStreamObserver.onNext(reply);
-                commitResponseStreamObserver.onCompleted();
-              } catch (IOException e) {
-                logger.warn(
-                    "error while trying to read index state dir for indexName: "
-                        + commitRequest.getIndexName(),
-                    e);
-                commitResponseStreamObserver.onError(
-                    Status.INTERNAL
-                        .withDescription(
+            Context.current()
+                .wrap(
+                    () -> {
+                      try {
+                        IndexState indexState = globalState.getIndex(commitRequest.getIndexName());
+                        long gen = indexState.commit(backupFromIncArchiver);
+                        CommitResponse reply =
+                            CommitResponse.newBuilder()
+                                .setGen(gen)
+                                .setPrimaryId(globalState.getEphemeralId())
+                                .build();
+                        logger.debug(
+                            String.format(
+                                "CommitHandler committed to index: %s for sequenceId: %s",
+                                commitRequest.getIndexName(), gen));
+                        commitResponseStreamObserver.onNext(reply);
+                        commitResponseStreamObserver.onCompleted();
+                      } catch (IOException e) {
+                        logger.warn(
                             "error while trying to read index state dir for indexName: "
-                                + commitRequest.getIndexName())
-                        .augmentDescription(e.getMessage())
-                        .withCause(e)
-                        .asRuntimeException());
-              } catch (Exception e) {
-                logger.warn(
-                    "error while trying to commit to  index " + commitRequest.getIndexName(), e);
-                commitResponseStreamObserver.onError(
-                    Status.UNKNOWN
-                        .withDescription(
-                            "error while trying to commit to index: "
-                                + commitRequest.getIndexName())
-                        .augmentDescription(e.getMessage())
-                        .asRuntimeException());
-              }
-              return null;
-            });
+                                + commitRequest.getIndexName(),
+                            e);
+                        commitResponseStreamObserver.onError(
+                            Status.INTERNAL
+                                .withDescription(
+                                    "error while trying to read index state dir for indexName: "
+                                        + commitRequest.getIndexName())
+                                .augmentDescription(e.getMessage())
+                                .withCause(e)
+                                .asRuntimeException());
+                      } catch (Exception e) {
+                        logger.warn(
+                            "error while trying to commit to  index "
+                                + commitRequest.getIndexName(),
+                            e);
+                        if (e instanceof StatusRuntimeException) {
+                          commitResponseStreamObserver.onError(e);
+                        } else {
+                          commitResponseStreamObserver.onError(
+                              Status.UNKNOWN
+                                  .withDescription(
+                                      "error while trying to commit to index: "
+                                          + commitRequest.getIndexName())
+                                  .augmentDescription(e.getMessage())
+                                  .asRuntimeException());
+                        }
+                      }
+                      return null;
+                    }));
       } catch (RejectedExecutionException e) {
         logger.error(
             "Threadpool is full, unable to submit commit to index {}",
@@ -879,6 +1065,8 @@ public class LuceneServer {
         SearchRequest searchRequest, StreamObserver<SearchResponse> searchResponseStreamObserver) {
       try {
         IndexState indexState = globalState.getIndex(searchRequest.getIndexName());
+        setResponseCompression(
+            searchRequest.getResponseCompression(), searchResponseStreamObserver);
         SearchHandler searchHandler = new SearchHandler(searchThreadPoolExecutor);
         SearchResponse reply = searchHandler.handle(indexState, searchRequest);
         searchResponseStreamObserver.onNext(reply);
@@ -908,14 +1096,18 @@ public class LuceneServer {
                 "error while trying to execute search for index %s: request: %s",
                 searchRequest.getIndexName(), searchRequestJson),
             e);
-        searchResponseStreamObserver.onError(
-            Status.UNKNOWN
-                .withDescription(
-                    String.format(
-                        "error while trying to execute search for index %s. check logs for full searchRequest.",
-                        searchRequest.getIndexName()))
-                .augmentDescription(e.getMessage())
-                .asRuntimeException());
+        if (e instanceof StatusRuntimeException) {
+          searchResponseStreamObserver.onError(e);
+        } else {
+          searchResponseStreamObserver.onError(
+              Status.UNKNOWN
+                  .withDescription(
+                      String.format(
+                          "error while trying to execute search for index %s. check logs for full searchRequest.",
+                          searchRequest.getIndexName()))
+                  .augmentDescription(e.getMessage())
+                  .asRuntimeException());
+        }
       }
     }
 
@@ -924,6 +1116,8 @@ public class LuceneServer {
         SearchRequest searchRequest, StreamObserver<Any> searchResponseStreamObserver) {
       try {
         IndexState indexState = globalState.getIndex(searchRequest.getIndexName());
+        setResponseCompression(
+            searchRequest.getResponseCompression(), searchResponseStreamObserver);
         SearchHandler searchHandler = new SearchHandler(searchThreadPoolExecutor);
         SearchResponse reply = searchHandler.handle(indexState, searchRequest);
         searchResponseStreamObserver.onNext(Any.pack(reply));
@@ -953,14 +1147,18 @@ public class LuceneServer {
                 "error while trying to execute search for index %s: request: %s",
                 searchRequest.getIndexName(), searchRequestJson),
             e);
-        searchResponseStreamObserver.onError(
-            Status.UNKNOWN
-                .withDescription(
-                    String.format(
-                        "error while trying to execute search for index %s. check logs for full searchRequest.",
-                        searchRequest.getIndexName()))
-                .augmentDescription(e.getMessage())
-                .asRuntimeException());
+        if (e instanceof StatusRuntimeException) {
+          searchResponseStreamObserver.onError(e);
+        } else {
+          searchResponseStreamObserver.onError(
+              Status.UNKNOWN
+                  .withDescription(
+                      String.format(
+                          "error while trying to execute search for index %s. check logs for full searchRequest.",
+                          searchRequest.getIndexName()))
+                  .augmentDescription(e.getMessage())
+                  .asRuntimeException());
+        }
       }
     }
 
@@ -1019,6 +1217,7 @@ public class LuceneServer {
     public void deleteAll(
         DeleteAllDocumentsRequest deleteAllDocumentsRequest,
         StreamObserver<DeleteAllDocumentsResponse> responseObserver) {
+      logger.info("Received delete all documents request: {}", deleteAllDocumentsRequest);
       try {
         IndexState indexState = globalState.getIndex(deleteAllDocumentsRequest.getIndexName());
         DeleteAllDocumentsResponse reply =
@@ -1044,6 +1243,7 @@ public class LuceneServer {
     public void deleteIndex(
         DeleteIndexRequest deleteIndexRequest,
         StreamObserver<DeleteIndexResponse> responseObserver) {
+      logger.info("Received delete index request: {}", deleteIndexRequest);
       try {
         IndexState indexState = globalState.getIndex(deleteIndexRequest.getIndexName());
         DeleteIndexResponse reply = new DeleteIndexHandler().handle(indexState, deleteIndexRequest);
@@ -1064,9 +1264,10 @@ public class LuceneServer {
     @Override
     public void stopIndex(
         StopIndexRequest stopIndexRequest, StreamObserver<DummyResponse> responseObserver) {
+      logger.info("Received stop index request: {}", stopIndexRequest);
       try {
-        IndexState indexState = globalState.getIndex(stopIndexRequest.getIndexName());
-        DummyResponse reply = new StopIndexHandler().handle(indexState, stopIndexRequest);
+        DummyResponse reply = globalState.stopIndex(stopIndexRequest);
+
         logger.info("StopIndexHandler returned " + reply.toString());
         responseObserver.onNext(reply);
         responseObserver.onCompleted();
@@ -1076,6 +1277,28 @@ public class LuceneServer {
             Status.INVALID_ARGUMENT
                 .withDescription(
                     "error while trying to stop index: " + stopIndexRequest.getIndexName())
+                .augmentDescription(e.getMessage())
+                .asRuntimeException());
+      }
+    }
+
+    @Override
+    public void reloadState(
+        ReloadStateRequest request, StreamObserver<ReloadStateResponse> responseObserver) {
+      try {
+        if (globalState.getConfiguration().getIndexStartConfig().getMode().equals(Mode.REPLICA)) {
+          globalState.reloadStateFromBackend();
+        } else {
+          logger.info("Skip reloading state since it is not replica");
+        }
+        ReloadStateResponse reloadStateResponse = ReloadStateResponse.newBuilder().build();
+        responseObserver.onNext(reloadStateResponse);
+        responseObserver.onCompleted();
+      } catch (Exception e) {
+        logger.warn("error while trying to sync the index state", e);
+        responseObserver.onError(
+            Status.INTERNAL
+                .withDescription("error while trying to sync the index state")
                 .augmentDescription(e.getMessage())
                 .asRuntimeException());
       }
@@ -1131,7 +1354,7 @@ public class LuceneServer {
 
       // If specific index names are provided we will check only those indices, otherwise check all
       if (request.getIndexNames().isEmpty()) {
-        indexNames = globalState.getIndexNames();
+        indexNames = globalState.getIndicesToStart();
       } else {
         List<String> indexNamesToCheck = COMMA_SPLITTER.splitToList(request.getIndexNames());
 
@@ -1155,7 +1378,8 @@ public class LuceneServer {
       try {
         List<String> indicesNotStarted = new ArrayList<>();
         for (String indexName : indexNames) {
-          IndexState indexState = globalState.getIndex(indexName);
+          // The ready endpoint should skip loading index state
+          IndexState indexState = globalState.getIndex(indexName, true);
           if (!indexState.isStarted()) {
             indicesNotStarted.add(indexName);
           }
@@ -1348,10 +1572,12 @@ public class LuceneServer {
     public void backupIndex(
         BackupIndexRequest backupIndexRequest,
         StreamObserver<BackupIndexResponse> responseObserver) {
+      logger.info("Received backup index request: {}", backupIndexRequest);
       try {
         IndexState indexState = globalState.getIndex(backupIndexRequest.getIndexName());
         BackupIndexRequestHandler backupIndexRequestHandler =
-            new BackupIndexRequestHandler(archiver, archiveDirectory);
+            new BackupIndexRequestHandler(
+                archiver, incArchiver, archiveDirectory, backupFromIncArchiver);
         BackupIndexResponse reply =
             backupIndexRequestHandler.handle(indexState, backupIndexRequest);
         logger.info(String.format("BackupRequestHandler returned results %s", reply.toString()));
@@ -1417,6 +1643,7 @@ public class LuceneServer {
     public void backupWarmingQueries(
         BackupWarmingQueriesRequest request,
         StreamObserver<BackupWarmingQueriesResponse> responseObserver) {
+      logger.info("Received backup warming queries request: {}", request);
       String index = request.getIndex();
       try {
         IndexState indexState = globalState.getIndex(index);
@@ -1540,6 +1767,7 @@ public class LuceneServer {
     @Override
     public void forceMerge(
         ForceMergeRequest forceMergeRequest, StreamObserver<ForceMergeResponse> responseObserver) {
+      logger.info("Received force merge request: {}", forceMergeRequest);
       if (forceMergeRequest.getIndexName().isEmpty()) {
         responseObserver.onError(new IllegalArgumentException("Index name in request is empty"));
         return;
@@ -1551,7 +1779,7 @@ public class LuceneServer {
 
       try {
         IndexState indexState = globalState.getIndex(forceMergeRequest.getIndexName());
-        ShardState shardState = indexState.shards.get(0);
+        ShardState shardState = indexState.getShards().get(0);
         logger.info("Beginning force merge for index: {}", forceMergeRequest.getIndexName());
         shardState.writer.forceMerge(
             forceMergeRequest.getMaxNumSegments(), forceMergeRequest.getDoWait());
@@ -1580,6 +1808,7 @@ public class LuceneServer {
     public void forceMergeDeletes(
         ForceMergeDeletesRequest forceMergeRequest,
         StreamObserver<ForceMergeDeletesResponse> responseObserver) {
+      logger.info("Received force merge deletes request: {}", forceMergeRequest);
       if (forceMergeRequest.getIndexName().isEmpty()) {
         responseObserver.onError(new IllegalArgumentException("Index name in request is empty"));
         return;
@@ -1587,7 +1816,7 @@ public class LuceneServer {
 
       try {
         IndexState indexState = globalState.getIndex(forceMergeRequest.getIndexName());
-        ShardState shardState = indexState.shards.get(0);
+        ShardState shardState = indexState.getShards().get(0);
         logger.info(
             "Beginning force merge deletes for index: {}", forceMergeRequest.getIndexName());
         shardState.writer.forceMergeDeletes(forceMergeRequest.getDoWait());
@@ -1613,6 +1842,21 @@ public class LuceneServer {
           ForceMergeDeletesResponse.newBuilder().setStatus(status).build();
       responseObserver.onNext(response);
       responseObserver.onCompleted();
+    }
+
+    @Override
+    public void custom(CustomRequest request, StreamObserver<CustomResponse> responseObserver) {
+      logger.info("Received custom request: {}", request);
+      try {
+        CustomResponse response = CustomRequestProcessor.processCustomRequest(request);
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+      } catch (Exception e) {
+        String error =
+            String.format("Error processing custom request %s, error: %s", request, e.getMessage());
+        logger.error(error);
+        responseObserver.onError(Status.INTERNAL.withDescription(error).withCause(e).asException());
+      }
     }
   }
 
@@ -1749,7 +1993,7 @@ public class LuceneServer {
                     .build();
             rawFileChunkStreamObserver.onNext(rawFileChunk);
             totalRead += chunkSize;
-            if (globalState.configuration.getFileSendDelay()) {
+            if (globalState.getConfiguration().getFileSendDelay()) {
               randomDelay(ThreadLocalRandom.current());
             }
           }
@@ -1773,9 +2017,10 @@ public class LuceneServer {
         private IndexState indexState;
         private IndexInput luceneFile;
         private byte[] buffer;
-        private final int ackEvery = globalState.configuration.getFileCopyConfig().getAckEvery();
+        private final int ackEvery =
+            globalState.getConfiguration().getFileCopyConfig().getAckEvery();
         private final int maxInflight =
-            globalState.configuration.getFileCopyConfig().getMaxInFlight();
+            globalState.getConfiguration().getFileCopyConfig().getMaxInFlight();
         private int lastAckedSeq = 0;
         private int currentSeq = 0;
         private long fileOffset;
@@ -1797,7 +2042,7 @@ public class LuceneServer {
               luceneFile.seek(fileInfoRequest.getFpStart());
               fileOffset = fileInfoRequest.getFpStart();
               fileLength = luceneFile.length();
-              buffer = new byte[globalState.configuration.getFileCopyConfig().getChunkSize()];
+              buffer = new byte[globalState.getConfiguration().getFileCopyConfig().getChunkSize()];
             } else {
               // ack existing transfer
               lastAckedSeq = fileInfoRequest.getAckSeqNum();

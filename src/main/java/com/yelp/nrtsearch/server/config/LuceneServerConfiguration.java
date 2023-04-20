@@ -16,6 +16,7 @@
 package com.yelp.nrtsearch.server.config;
 
 import com.google.inject.Inject;
+import com.yelp.nrtsearch.server.grpc.ReplicationServerClient;
 import com.yelp.nrtsearch.server.luceneserver.warming.WarmerConfig;
 import java.io.InputStream;
 import java.nio.file.Path;
@@ -27,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.apache.lucene.search.suggest.document.CompletionPostingsFormat.FSTLoadMode;
 
 public class LuceneServerConfiguration {
   private static final Pattern ENV_VAR_PATTERN = Pattern.compile("\\$\\{([A-Za-z0-9_]+)}");
@@ -56,6 +58,8 @@ public class LuceneServerConfiguration {
   private static final Path DEFAULT_PLUGIN_SEARCH_PATH =
       Paths.get(DEFAULT_USER_DIR.toString(), "plugins");
   private static final String DEFAULT_SERVICE_NAME = "nrtsearch-generic";
+  static final long DEFAULT_INITIAL_SYNC_PRIMARY_WAIT_MS = 30000;
+  static final long DEFAULT_INITIAL_SYNC_MAX_TIME_MS = 600000; // 10m
   private final int port;
   private final int replicationPort;
   private final int replicaReplicationPortPingInterval;
@@ -73,6 +77,8 @@ public class LuceneServerConfiguration {
   private final String pluginSearchPath;
   private final String serviceName;
   private final boolean restoreState;
+  private final boolean restoreFromIncArchiver;
+  private final boolean backupWithIncArchiver;
   private final ThreadPoolConfiguration threadPoolConfiguration;
   private final IndexPreloadConfig preloadConfig;
   private final QueryCacheConfig queryCacheConfig;
@@ -80,9 +86,19 @@ public class LuceneServerConfiguration {
   private final boolean downloadAsStream;
   private final boolean fileSendDelay;
   private final boolean virtualSharding;
+  private final boolean decInitialCommit;
   private final boolean syncInitialNrtPoint;
+  private final long initialSyncPrimaryWaitMs;
+  private final long initialSyncMaxTimeMs;
   private final boolean indexVerbose;
   private final FileCopyConfig fileCopyConfig;
+  private final ScriptCacheConfig scriptCacheConfig;
+  private final boolean deadlineCancellation;
+  private final StateConfig stateConfig;
+  private final IndexStartConfig indexStartConfig;
+  private final int discoveryFileUpdateIntervalMs;
+  private final FSTLoadMode completionCodecLoadMode;
+  private final boolean filterIncompatibleSegmentReaders;
 
   private final YamlConfigReader configReader;
   private final long maxConnectionAgeForReplication;
@@ -122,22 +138,40 @@ public class LuceneServerConfiguration {
       metricsBuckets = DEFAULT_METRICS_BUCKETS;
     }
     this.metricsBuckets = metricsBuckets;
-    publishJvmMetrics = configReader.getBoolean("publishJvmMetrics", false);
+    publishJvmMetrics = configReader.getBoolean("publishJvmMetrics", true);
     plugins = configReader.getStringList("plugins", DEFAULT_PLUGINS).toArray(new String[0]);
     pluginSearchPath =
         configReader.getString("pluginSearchPath", DEFAULT_PLUGIN_SEARCH_PATH.toString());
     serviceName = configReader.getString("serviceName", DEFAULT_SERVICE_NAME);
     restoreState = configReader.getBoolean("restoreState", false);
+    restoreFromIncArchiver = configReader.getBoolean("restoreFromIncArchiver", false);
+    backupWithIncArchiver = configReader.getBoolean("backupWithIncArchiver", false);
     preloadConfig = IndexPreloadConfig.fromConfig(configReader);
     queryCacheConfig = QueryCacheConfig.fromConfig(configReader);
     warmerConfig = WarmerConfig.fromConfig(configReader);
-    downloadAsStream = configReader.getBoolean("downloadAsStream", false);
-    fileSendDelay = configReader.getBoolean("fileSendDelay", true);
+    downloadAsStream = configReader.getBoolean("downloadAsStream", true);
+    fileSendDelay = configReader.getBoolean("fileSendDelay", false);
     virtualSharding = configReader.getBoolean("virtualSharding", false);
-    syncInitialNrtPoint = configReader.getBoolean("syncInitialNrtPoint", false);
+    decInitialCommit = configReader.getBoolean("decInitialCommit", true);
+    syncInitialNrtPoint = configReader.getBoolean("syncInitialNrtPoint", true);
+    initialSyncPrimaryWaitMs =
+        configReader.getLong("initialSyncPrimaryWaitMs", DEFAULT_INITIAL_SYNC_PRIMARY_WAIT_MS);
+    initialSyncMaxTimeMs =
+        configReader.getLong("initialSyncMaxTimeMs", DEFAULT_INITIAL_SYNC_MAX_TIME_MS);
     indexVerbose = configReader.getBoolean("indexVerbose", false);
     fileCopyConfig = FileCopyConfig.fromConfig(configReader);
     threadPoolConfiguration = new ThreadPoolConfiguration(configReader);
+    scriptCacheConfig = ScriptCacheConfig.fromConfig(configReader);
+    deadlineCancellation = configReader.getBoolean("deadlineCancellation", false);
+    stateConfig = StateConfig.fromConfig(configReader);
+    indexStartConfig = IndexStartConfig.fromConfig(configReader);
+    discoveryFileUpdateIntervalMs =
+        configReader.getInteger(
+            "discoveryFileUpdateIntervalMs", ReplicationServerClient.FILE_UPDATE_INTERVAL_MS);
+    completionCodecLoadMode =
+        FSTLoadMode.valueOf(configReader.getString("completionCodecLoadMode", "ON_HEAP"));
+    filterIncompatibleSegmentReaders =
+        configReader.getBoolean("filterIncompatibleSegmentReaders", false);
   }
 
   public ThreadPoolConfiguration getThreadPoolConfiguration() {
@@ -212,6 +246,14 @@ public class LuceneServerConfiguration {
     return restoreState;
   }
 
+  public boolean getRestoreFromIncArchiver() {
+    return restoreFromIncArchiver;
+  }
+
+  public boolean getBackupWithInArchiver() {
+    return backupWithIncArchiver;
+  }
+
   public IndexPreloadConfig getPreloadConfig() {
     return preloadConfig;
   }
@@ -236,8 +278,20 @@ public class LuceneServerConfiguration {
     return virtualSharding;
   }
 
+  public boolean getDecInitialCommit() {
+    return decInitialCommit;
+  }
+
   public boolean getSyncInitialNrtPoint() {
     return syncInitialNrtPoint;
+  }
+
+  public long getInitialSyncPrimaryWaitMs() {
+    return initialSyncPrimaryWaitMs;
+  }
+
+  public long getInitialSyncMaxTimeMs() {
+    return initialSyncMaxTimeMs;
   }
 
   public boolean getIndexVerbose() {
@@ -250,6 +304,34 @@ public class LuceneServerConfiguration {
 
   public YamlConfigReader getConfigReader() {
     return configReader;
+  }
+
+  public ScriptCacheConfig getScriptCacheConfig() {
+    return scriptCacheConfig;
+  }
+
+  public boolean getDeadlineCancellation() {
+    return deadlineCancellation;
+  }
+
+  public StateConfig getStateConfig() {
+    return stateConfig;
+  }
+
+  public IndexStartConfig getIndexStartConfig() {
+    return indexStartConfig;
+  }
+
+  public int getDiscoveryFileUpdateIntervalMs() {
+    return discoveryFileUpdateIntervalMs;
+  }
+
+  public FSTLoadMode getCompletionCodecLoadMode() {
+    return completionCodecLoadMode;
+  }
+
+  public boolean getFilterIncompatibleSegmentReaders() {
+    return filterIncompatibleSegmentReaders;
   }
 
   /**

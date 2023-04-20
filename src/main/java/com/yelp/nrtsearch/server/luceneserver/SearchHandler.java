@@ -18,6 +18,7 @@ package com.yelp.nrtsearch.server.luceneserver;
 import com.google.common.collect.Lists;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
+import com.yelp.nrtsearch.server.grpc.DeadlineUtils;
 import com.yelp.nrtsearch.server.grpc.FacetResult;
 import com.yelp.nrtsearch.server.grpc.ProfileResult;
 import com.yelp.nrtsearch.server.grpc.SearchRequest;
@@ -38,6 +39,7 @@ import com.yelp.nrtsearch.server.luceneserver.field.ObjectFieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.PolygonfieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.VirtualFieldDef;
 import com.yelp.nrtsearch.server.luceneserver.rescore.RescoreTask;
+import com.yelp.nrtsearch.server.luceneserver.search.FieldFetchContext;
 import com.yelp.nrtsearch.server.luceneserver.search.SearchContext;
 import com.yelp.nrtsearch.server.luceneserver.search.SearchCutoffWrapper.CollectionTimeoutException;
 import com.yelp.nrtsearch.server.luceneserver.search.SearchRequestProcessor;
@@ -93,6 +95,9 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
   @Override
   public SearchResponse handle(IndexState indexState, SearchRequest searchRequest)
       throws SearchHandlerException {
+    // this request may have been waiting in the grpc queue too long
+    DeadlineUtils.checkDeadline("SearchHandler: start", "SEARCH");
+
     ShardState shardState = indexState.getShard(0);
 
     // Index won't be started if we are currently warming
@@ -105,7 +110,9 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
     SearcherTaxonomyManager.SearcherAndTaxonomy s = null;
     SearchContext searchContext;
     try {
-      s = getSearcherAndTaxonomy(searchRequest, shardState, diagnostics, threadPoolExecutor);
+      s =
+          getSearcherAndTaxonomy(
+              searchRequest, indexState, shardState, diagnostics, threadPoolExecutor);
 
       ProfileResult.Builder profileResultBuilder = null;
       if (searchRequest.getProfile()) {
@@ -118,7 +125,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
 
       long searchStartTime = System.nanoTime();
 
-      SearcherResult searcherResult;
+      SearcherResult searcherResult = null;
       TopDocs hits;
       if (!searchRequest.getFacetsList().isEmpty()) {
         if (!(searchContext.getQuery() instanceof DrillDownQuery)) {
@@ -130,10 +137,11 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
         DrillSideways drillS =
             new DrillSidewaysImpl(
                 s.searcher,
-                indexState.facetsConfig,
+                indexState.getFacetsConfig(),
                 s.taxonomyReader,
                 searchRequest.getFacetsList(),
                 s,
+                indexState,
                 shardState,
                 searchContext.getQueryFields(),
                 grpcFacetResults,
@@ -180,6 +188,8 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
 
       diagnostics.setFirstPassSearchTimeMs(((System.nanoTime() - searchStartTime) / 1000000.0));
 
+      DeadlineUtils.checkDeadline("SearchHandler: post recall", "SEARCH");
+
       // add detailed timing metrics for query execution
       if (profileResultBuilder != null) {
         searchContext.getCollector().maybeAddProfiling(profileResultBuilder);
@@ -193,6 +203,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
           hits = rescorer.rescore(hits, searchContext);
           long endNS = System.nanoTime();
           diagnostics.putRescorersTimeMs(rescorer.getName(), (endNS - startNS) / 1000000.0);
+          DeadlineUtils.checkDeadline("SearchHandler: post " + rescorer.getName(), "SEARCH");
         }
         diagnostics.setRescoreTimeMs(((System.nanoTime() - rescoreStartTime) / 1000000.0));
       }
@@ -220,8 +231,12 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
         searchState.setLastDocId(lastHit.doc);
         searchContext.getCollector().fillLastHit(searchState, lastHit);
       }
+      searchContext.getResponseBuilder().setSearchState(searchState);
 
       diagnostics.setGetFieldsTimeMs(((System.nanoTime() - t0) / 1000000.0));
+      if (searchContext.getHighlightFetchTask() != null) {
+        diagnostics.setHighlightTimeMs(searchContext.getHighlightFetchTask().getTimeTakenMs());
+      }
       searchContext.getResponseBuilder().setDiagnostics(diagnostics);
 
       if (profileResultBuilder != null) {
@@ -258,6 +273,8 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
       logger.error("Unable to add warming query", e);
     }
 
+    // if we are out of time, don't bother with serialization
+    DeadlineUtils.checkDeadline("SearchHandler: end", "SEARCH");
     return searchContext.getResponseBuilder().build();
   }
 
@@ -347,6 +364,10 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
         var hitResponse = hitBuilders.get(hitIndex);
         LeafReaderContext leaf = hitIdToLeaves.get(hitIndex);
         searchContext.getFetchTasks().processHit(searchContext, leaf, hitResponse);
+        // TODO: combine with custom fetch tasks
+        if (searchContext.getHighlightFetchTask() != null) {
+          searchContext.getHighlightFetchTask().processHit(searchContext, leaf, hitResponse);
+        }
       }
     } else if (!parallelFetchByField
         && fetch_thread_pool_size > 1
@@ -397,7 +418,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
    * @return slice of hits starting at given offset, or empty slice if there are less than startHit
    *     docs
    */
-  private static TopDocs getHitsFromOffset(TopDocs hits, int startHit, int topHits) {
+  public static TopDocs getHitsFromOffset(TopDocs hits, int startHit, int topHits) {
     int retrieveHits = Math.min(topHits, hits.scoreDocs.length);
     if (startHit != 0 || retrieveHits != hits.scoreDocs.length) {
       // Slice:
@@ -440,11 +461,11 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
    */
   public static SearcherTaxonomyManager.SearcherAndTaxonomy getSearcherAndTaxonomy(
       SearchRequest searchRequest,
+      IndexState indexState,
       ShardState state,
       SearchResponse.Diagnostics.Builder diagnostics,
       ThreadPoolExecutor threadPoolExecutor)
       throws InterruptedException, IOException {
-    Logger logger = LoggerFactory.getLogger(SearcherTaxonomyManager.SearcherAndTaxonomy.class);
     // TODO: Figure out which searcher to use:
     // final long searcherVersion; e.g. searcher.getLong("version")
     // final IndexState.Gens searcherSnapshot; e.g. searcher.getLong("indexGen")
@@ -472,7 +493,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
           // against since this server started, or the call
           // to createSnapshot didn't specify
           // openSearcher=true; now open the reader:
-          s = openSnapshotReader(state, snapshot, diagnostics, threadPoolExecutor);
+          s = openSnapshotReader(indexState, state, snapshot, diagnostics, threadPoolExecutor);
         } else {
           SearcherTaxonomyManager.SearcherAndTaxonomy current = state.acquire();
           long currentVersion = ((DirectoryReader) current.searcher.getIndexReader()).getVersion();
@@ -604,6 +625,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
 
   /** Returns a ref. */
   private static SearcherTaxonomyManager.SearcherAndTaxonomy openSnapshotReader(
+      IndexState indexState,
       ShardState state,
       IndexState.Gens snapshot,
       SearchResponse.Diagnostics.Builder diagnostics,
@@ -637,9 +659,9 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
                   r,
                   new MyIndexSearcher.ExecutorWithParams(
                       threadPoolExecutor,
-                      state.indexState.getSliceMaxDocs(),
-                      state.indexState.getSliceMaxSegments(),
-                      state.indexState.getVirtualShards())),
+                      indexState.getSliceMaxDocs(),
+                      indexState.getSliceMaxSegments(),
+                      indexState.getVirtualShards())),
               s.taxonomyReader);
       state.slm.record(result.searcher);
       long t1 = System.nanoTime();
@@ -677,7 +699,6 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
     }
 
     private List<Map<String, CompositeFieldValue>> fillFields(
-        IndexState state,
         IndexSearcher s,
         List<Hit.Builder> hitBuilders,
         List<String> fields,
@@ -692,7 +713,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
           var hitResponse = hitBuilders.get(hitIndex);
           LeafReaderContext leaf = hitIdToleaves.get(hitIndex);
           CompositeFieldValue v =
-              getFieldForHit(state, s, hitResponse, leaf, field, searchContext.getRetrieveFields());
+              getFieldForHit(s, hitResponse, leaf, field, searchContext.getRetrieveFields());
           values.get(hitIndex).put(field, v);
         }
       }
@@ -705,7 +726,6 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
      * @return
      */
     private CompositeFieldValue getFieldForHit(
-        IndexState state,
         IndexSearcher s,
         Hit.Builder hit,
         LeafReaderContext leaf,
@@ -715,11 +735,6 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
       assert field != null;
       CompositeFieldValue.Builder compositeFieldValue = CompositeFieldValue.newBuilder();
       FieldDef fd = dynamicFields.get(field);
-
-      // TODO: get highlighted fields as well
-      // Map<String,Object> doc = highlighter.getDocument(state, s, hit.doc);
-      Map<String, Object> doc = new HashMap<>();
-      boolean docIdAdvanced = false;
 
       // We detect invalid field above:
       assert fd != null;
@@ -768,22 +783,8 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
           }
         }
       } else {
-        Object v = doc.get(field); // FIXME: doc is never updated, not sure if this is correct
-        if (v != null) {
-          if (fd instanceof IndexableFieldDef && !((IndexableFieldDef) fd).isMultiValue()) {
-            compositeFieldValue.addFieldValue(convertType(fd, v));
-          } else {
-            if (!(v instanceof List)) {
-              // FIXME: not sure this is serializable to string?
-              compositeFieldValue.addFieldValue(convertType(fd, v));
-            } else {
-              for (Object o : (List<Object>) v) {
-                // FIXME: not sure this is serializable to string?
-                compositeFieldValue.addFieldValue(convertType(fd, o));
-              }
-            }
-          }
-        }
+        // TODO: throw exception here after confirming that legitimate requests do not enter this
+        logger.error("Unable to fill hit for field: {}", field);
       }
 
       return compositeFieldValue.build();
@@ -791,30 +792,30 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
 
     @Override
     public List<Map<String, CompositeFieldValue>> call() throws IOException {
-      return fillFields(state, s, hitBuilders, fields, searchContext);
+      return fillFields(s, hitBuilders, fields, searchContext);
     }
   }
 
   /** Task to fetch all the fields for a chunk of hits. Also executes any per hit fetch tasks. */
   public static class FillDocsTask implements Runnable {
-    private final SearchContext searchContext;
+    private final FieldFetchContext fieldFetchContext;
     private final List<Hit.Builder> docChunk;
 
     /**
      * Constructor.
      *
-     * @param searchContext search parameters
+     * @param fieldFetchContext context info needed to retrieve field data
      * @param docChunk list of hit builders for query response, must be in lucene doc id order
      */
-    public FillDocsTask(SearchContext searchContext, List<Hit.Builder> docChunk) {
-      this.searchContext = searchContext;
+    public FillDocsTask(FieldFetchContext fieldFetchContext, List<Hit.Builder> docChunk) {
+      this.fieldFetchContext = fieldFetchContext;
       this.docChunk = docChunk;
     }
 
     @Override
     public void run() {
       List<LeafReaderContext> leaves =
-          searchContext.getSearcherAndTaxonomy().searcher.getIndexReader().leaves();
+          fieldFetchContext.getSearcherAndTaxonomy().searcher.getIndexReader().leaves();
       int hitIndex = 0;
       // process documents, grouped by lucene segment
       while (hitIndex < docChunk.size()) {
@@ -824,7 +825,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
         // get all hits in the same segment and process them together for better resource reuse
         List<Hit.Builder> sliceHits = getSliceHits(docChunk, hitIndex, sliceSegment);
         try {
-          fetchSlice(searchContext, sliceHits, sliceSegment);
+          fetchSlice(fieldFetchContext, sliceHits, sliceSegment);
         } catch (IOException e) {
           throw new RuntimeException("Error fetching field data", e);
         }
@@ -853,13 +854,13 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
      * Fetch all the required field data For a slice of hits. All these hit reside in the same
      * lucene segment.
      *
-     * @param context search context
+     * @param context field fetch context
      * @param sliceHits hits in this slice
      * @param sliceSegment lucene segment context for slice
      * @throws IOException on issue reading document data
      */
     private static void fetchSlice(
-        SearchContext context,
+        FieldFetchContext context,
         List<SearchResponse.Hit.Builder> sliceHits,
         LeafReaderContext sliceSegment)
         throws IOException {
@@ -888,7 +889,14 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
 
       // execute any per hit fetch tasks
       for (Hit.Builder hit : sliceHits) {
-        context.getFetchTasks().processHit(context, sliceSegment, hit);
+        context.getFetchTasks().processHit(context.getSearchContext(), sliceSegment, hit);
+        // TODO: combine with custom fetch tasks
+        if (context.getSearchContext().getHighlightFetchTask() != null) {
+          context
+              .getSearchContext()
+              .getHighlightFetchTask()
+              .processHit(context.getSearchContext(), sliceSegment, hit);
+        }
       }
     }
 
@@ -940,7 +948,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
 
     /** Fetch field value stored in the index */
     private static void fetchFromStored(
-        SearchContext context,
+        FieldFetchContext context,
         List<SearchResponse.Hit.Builder> sliceHits,
         String name,
         IndexableFieldDef indexableFieldDef)

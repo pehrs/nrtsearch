@@ -50,9 +50,10 @@ Below is a depiction of how the system works in regards to Near-real-time (NRT) 
 Build Server and Client
 ---------------------------
 
-In the home directory.
+In the home directory, one can build nrtSearch locally like this:
 
 .. code-block::
+
   ./gradlew clean installDist test
 
 Note: This code has been tested on *Java14*.
@@ -60,7 +61,10 @@ Note: This code has been tested on *Java14*.
 Run gRPC Server
 ---------------------------
 
+The server can be run locally like this:
+
 .. code-block::
+
   ./build/install/nrtsearch/bin/lucene-server
 
 Run REST Server
@@ -69,4 +73,5 @@ Run REST Server
 Use the appropriate binary for your platform e.g. for Mac OS X:
 
 .. code-block::
+
   ./build/install/nrtsearch/bin/http_wrapper-darwin-amd64 <gRPC_PORT> <REST_PORT>

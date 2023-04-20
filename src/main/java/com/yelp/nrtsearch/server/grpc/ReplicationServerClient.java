@@ -15,8 +15,14 @@
  */
 package com.yelp.nrtsearch.server.grpc;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.GeneratedMessageV3;
+import com.yelp.nrtsearch.server.grpc.ReplicationServerGrpc.ReplicationServerBlockingStub;
+import com.yelp.nrtsearch.server.grpc.discovery.PrimaryFileNameResolverProvider;
 import com.yelp.nrtsearch.server.luceneserver.SimpleCopyJob.FileChunkStreamingIterator;
+import io.grpc.Deadline;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
@@ -32,9 +38,16 @@ import org.slf4j.LoggerFactory;
 public class ReplicationServerClient implements Closeable {
   public static final int BINARY_MAGIC = 0x3414f5c;
   public static final int MAX_MESSAGE_BYTES_SIZE = 1 * 1024 * 1024 * 1024;
-  Logger logger = LoggerFactory.getLogger(ReplicationServerClient.class);
+  public static final int FILE_UPDATE_INTERVAL_MS = 10 * 1000; // 10 seconds
+
+  private static final ObjectMapper OBJECT_MAPPER =
+      new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);;
+  private static final Logger logger = LoggerFactory.getLogger(ReplicationServerClient.class);
+
   private final String host;
   private final int port;
+  private final String discoveryFile;
+  private int discoveryFileUpdateIntervalMs;
   private final ManagedChannel channel;
 
   public ReplicationServerGrpc.ReplicationServerBlockingStub getBlockingStub() {
@@ -48,6 +61,26 @@ public class ReplicationServerClient implements Closeable {
   private final ReplicationServerGrpc.ReplicationServerBlockingStub blockingStub;
   private final ReplicationServerGrpc.ReplicationServerStub asyncStub;
 
+  /**
+   * Container class the hold the path to a service discovery file and a port. If the port is <= 0,
+   * the port value from the discovery file is used.
+   */
+  public static class DiscoveryFileAndPort {
+    public final String discoveryFile;
+    public final int port;
+
+    /**
+     * Contructor.
+     *
+     * @param discoveryFile path to service discovery file
+     * @param port port
+     */
+    public DiscoveryFileAndPort(String discoveryFile, int port) {
+      this.discoveryFile = discoveryFile;
+      this.port = port;
+    }
+  }
+
   /** Construct client connecting to ReplicationServer server at {@code host:port}. */
   public ReplicationServerClient(String host, int port) {
     this(
@@ -58,11 +91,44 @@ public class ReplicationServerClient implements Closeable {
             .maxInboundMessageSize(MAX_MESSAGE_BYTES_SIZE)
             .build(),
         host,
-        port);
+        port,
+        "");
+  }
+
+  /**
+   * Construct client connecting to a ReplicationServer based on the host/port in a service
+   * discovery file.
+   *
+   * @param discoveryFileAndPort discovery file with potential port override
+   */
+  public ReplicationServerClient(DiscoveryFileAndPort discoveryFileAndPort) {
+    this(discoveryFileAndPort, FILE_UPDATE_INTERVAL_MS);
+  }
+
+  /**
+   * Construct client connecting to a ReplicationServer based on the host/port in a service
+   * discovery file.
+   *
+   * @param discoveryFileAndPort discovery file with potential port override
+   * @param updateIntervalMs how often to check if the primary address has been updated
+   */
+  public ReplicationServerClient(DiscoveryFileAndPort discoveryFileAndPort, int updateIntervalMs) {
+    this(
+        ManagedChannelBuilder.forTarget(discoveryFileAndPort.discoveryFile)
+            .usePlaintext()
+            .maxInboundMessageSize(MAX_MESSAGE_BYTES_SIZE)
+            .nameResolverFactory(
+                new PrimaryFileNameResolverProvider(
+                    OBJECT_MAPPER, updateIntervalMs, discoveryFileAndPort.port))
+            .build(),
+        "",
+        discoveryFileAndPort.port,
+        discoveryFileAndPort.discoveryFile);
+    this.discoveryFileUpdateIntervalMs = updateIntervalMs;
   }
 
   /** Construct client for accessing ReplicationServer server using the existing channel. */
-  ReplicationServerClient(ManagedChannel channel, String host, int port) {
+  ReplicationServerClient(ManagedChannel channel, String host, int port, String discoveryFile) {
     this.channel = channel;
     blockingStub =
         ReplicationServerGrpc.newBlockingStub(channel)
@@ -74,6 +140,12 @@ public class ReplicationServerClient implements Closeable {
             .withMaxOutboundMessageSize(MAX_MESSAGE_BYTES_SIZE);
     this.host = host;
     this.port = port;
+    this.discoveryFile = discoveryFile;
+  }
+
+  @VisibleForTesting
+  int getDiscoveryFileUpdateIntervalMs() {
+    return discoveryFileUpdateIntervalMs;
   }
 
   public String getHost() {
@@ -82,6 +154,10 @@ public class ReplicationServerClient implements Closeable {
 
   public int getPort() {
     return port;
+  }
+
+  public String getDiscoveryFile() {
+    return discoveryFile;
   }
 
   @Override
@@ -98,15 +174,12 @@ public class ReplicationServerClient implements Closeable {
     channel.shutdown();
     boolean res = channel.awaitTermination(10, TimeUnit.SECONDS);
     if (!res) {
-      logger.warn(
-          String.format(
-              "channel on host:%s, port:%s shutdown was not shutdown cleanly",
-              getHost(), getPort()));
+      logger.warn(String.format("channel on %s shutdown was not shutdown cleanly", this));
     }
   }
 
   public void addReplicas(String indexName, int replicaId, String hostName, int port) {
-    AddReplicaRequest addDocumentRequest =
+    AddReplicaRequest addReplicaRequest =
         AddReplicaRequest.newBuilder()
             .setMagicNumber(BINARY_MAGIC)
             .setIndexName(indexName)
@@ -115,7 +188,7 @@ public class ReplicationServerClient implements Closeable {
             .setPort(port)
             .build();
     try {
-      this.blockingStub.addReplicas(addDocumentRequest);
+      this.blockingStub.addReplicas(addReplicaRequest);
     } catch (Exception e) {
       /* Note this should allow the replica to start, but it means it will not be able to get new index updates
        * from Primary: https://github.com/Yelp/nrtsearch/issues/86 */
@@ -158,7 +231,7 @@ public class ReplicationServerClient implements Closeable {
   }
 
   public Iterator<TransferStatus> copyFiles(
-      String indexName, long primaryGen, FilesMetadata filesMetadata) {
+      String indexName, long primaryGen, FilesMetadata filesMetadata, Deadline deadline) {
     CopyFiles.Builder copyFilesBuilder = CopyFiles.newBuilder();
     CopyFiles copyFiles =
         copyFilesBuilder
@@ -167,7 +240,11 @@ public class ReplicationServerClient implements Closeable {
             .setPrimaryGen(primaryGen)
             .setFilesMetadata(filesMetadata)
             .build();
-    return this.blockingStub.copyFiles(copyFiles);
+    ReplicationServerBlockingStub blockingStub = this.blockingStub;
+    if (deadline != null) {
+      blockingStub = blockingStub.withDeadline(deadline);
+    }
+    return blockingStub.copyFiles(copyFiles);
   }
 
   public TransferStatus newNRTPoint(String indexName, long primaryGen, long version) {
@@ -205,6 +282,7 @@ public class ReplicationServerClient implements Closeable {
     return port == that.port
         && Objects.equals(logger, that.logger)
         && Objects.equals(host, that.host)
+        && Objects.equals(discoveryFile, that.discoveryFile)
         && Objects.equals(channel, that.channel)
         && Objects.equals(blockingStub, that.blockingStub)
         && Objects.equals(asyncStub, that.asyncStub);
@@ -276,6 +354,7 @@ public class ReplicationServerClient implements Closeable {
 
   @Override
   public String toString() {
-    return String.format("ReplicationServerClient(%s:%s)", host, port);
+    return String.format(
+        "ReplicationServerClient(host=%s, port=%d, discoveryFile=%s)", host, port, discoveryFile);
   }
 }

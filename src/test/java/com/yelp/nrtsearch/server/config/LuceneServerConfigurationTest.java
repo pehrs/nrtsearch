@@ -17,9 +17,11 @@ package com.yelp.nrtsearch.server.config;
 
 import static org.junit.Assert.assertEquals;
 
+import com.yelp.nrtsearch.server.grpc.ReplicationServerClient;
 import java.io.ByteArrayInputStream;
 import java.lang.reflect.Field;
 import java.util.Map;
+import org.apache.lucene.search.suggest.document.CompletionPostingsFormat.FSTLoadMode;
 import org.junit.Test;
 
 public class LuceneServerConfigurationTest {
@@ -77,5 +79,68 @@ public class LuceneServerConfigurationTest {
             "\n", "nodeName: \"lucene_server_foo\"", "hostName: my_${VAR4}_${VAR3}_${VAR4}_host");
     LuceneServerConfiguration luceneConfig = getForConfig(config);
     assertEquals("my__v3__host", luceneConfig.getHostName());
+  }
+
+  @Test
+  public void testDefaultDiscoveryFileUpdateInterval() {
+    String config = "nodeName: \"lucene_server_foo\"";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(
+        ReplicationServerClient.FILE_UPDATE_INTERVAL_MS,
+        luceneConfig.getDiscoveryFileUpdateIntervalMs());
+  }
+
+  @Test
+  public void testSetDiscoveryFileUpdateInterval() {
+    String config =
+        String.join("\n", "nodeName: \"lucene_server_foo\"", "discoveryFileUpdateIntervalMs: 100");
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(100, luceneConfig.getDiscoveryFileUpdateIntervalMs());
+  }
+
+  @Test
+  public void testDefaultCompletionCodecLoadMode() {
+    String config = "nodeName: \"lucene_server_foo\"";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(FSTLoadMode.ON_HEAP, luceneConfig.getCompletionCodecLoadMode());
+  }
+
+  @Test
+  public void testSetCompletionCodecLoadMode() {
+    String config = "completionCodecLoadMode: OFF_HEAP";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(FSTLoadMode.OFF_HEAP, luceneConfig.getCompletionCodecLoadMode());
+  }
+
+  @Test
+  public void testInitialSyncPrimaryWaitMs_default() {
+    String config = "nodeName: \"lucene_server_foo\"";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(
+        LuceneServerConfiguration.DEFAULT_INITIAL_SYNC_PRIMARY_WAIT_MS,
+        luceneConfig.getInitialSyncPrimaryWaitMs());
+  }
+
+  @Test
+  public void testInitialSyncPrimaryWaitMs_set() {
+    String config = "initialSyncPrimaryWaitMs: 100";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(100L, luceneConfig.getInitialSyncPrimaryWaitMs());
+  }
+
+  @Test
+  public void testInitialSyncMaxTimeMs_default() {
+    String config = "nodeName: \"lucene_server_foo\"";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(
+        LuceneServerConfiguration.DEFAULT_INITIAL_SYNC_MAX_TIME_MS,
+        luceneConfig.getInitialSyncMaxTimeMs());
+  }
+
+  @Test
+  public void testInitialSyncMaxTimeMs_set() {
+    String config = "initialSyncMaxTimeMs: 100";
+    LuceneServerConfiguration luceneConfig = getForConfig(config);
+    assertEquals(100L, luceneConfig.getInitialSyncMaxTimeMs());
   }
 }

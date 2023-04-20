@@ -15,6 +15,7 @@
  */
 package com.yelp.nrtsearch.server.luceneserver;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.yelp.nrtsearch.server.grpc.FileMetadata;
 import com.yelp.nrtsearch.server.grpc.FilesMetadata;
 import com.yelp.nrtsearch.server.grpc.GetNodesResponse;
@@ -30,10 +31,13 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.replicator.nrt.CopyJob;
 import org.apache.lucene.replicator.nrt.CopyState;
 import org.apache.lucene.replicator.nrt.FileMetaData;
+import org.apache.lucene.replicator.nrt.FilteringSegmentInfosSearcherManager;
 import org.apache.lucene.replicator.nrt.NodeCommunicationException;
+import org.apache.lucene.replicator.nrt.ReplicaDeleterManager;
 import org.apache.lucene.replicator.nrt.ReplicaNode;
 import org.apache.lucene.search.SearcherFactory;
 import org.apache.lucene.store.Directory;
@@ -45,14 +49,16 @@ public class NRTReplicaNode extends ReplicaNode {
   private static final long NRT_CONNECT_WAIT_MS = 500;
 
   private final ReplicationServerClient primaryAddress;
+  private final ReplicaDeleterManager replicaDeleterManager;
   private final String indexName;
   private final boolean ackedCopy;
+  private final boolean filterIncompatibleSegmentReaders;
   final Jobs jobs;
 
   /* Just a wrapper class to hold our <hostName, port> pair so that we can send them to the Primary
    * on sendReplicas and it can build its channel over this pair */
   private final HostPort hostPort;
-  Logger logger = LoggerFactory.getLogger(NRTPrimaryNode.class);
+  private static final Logger logger = LoggerFactory.getLogger(NRTReplicaNode.class);
 
   public NRTReplicaNode(
       String indexName,
@@ -62,20 +68,61 @@ public class NRTReplicaNode extends ReplicaNode {
       Directory indexDir,
       SearcherFactory searcherFactory,
       PrintStream printStream,
-      long primaryGen,
-      boolean ackedCopy)
+      boolean ackedCopy,
+      boolean decInitialCommit,
+      boolean filterIncompatibleSegmentReaders)
       throws IOException {
     super(replicaId, indexDir, searcherFactory, printStream);
     this.primaryAddress = primaryAddress;
     this.indexName = indexName;
     this.ackedCopy = ackedCopy;
     this.hostPort = hostPort;
+    replicaDeleterManager = decInitialCommit ? new ReplicaDeleterManager(this) : null;
+    this.filterIncompatibleSegmentReaders = filterIncompatibleSegmentReaders;
     // Handles fetching files from primary, on a new thread which receives files from primary
     jobs = new Jobs(this);
     jobs.setName("R" + id + ".copyJobs");
     jobs.setDaemon(true);
     jobs.start();
-    start(primaryGen);
+  }
+
+  private long getLastPrimaryGen() throws IOException {
+    // detection logic from ReplicaNode
+    String segmentsFileName = SegmentInfos.getLastCommitSegmentsFileName(dir);
+    if (segmentsFileName == null) {
+      return -1;
+    }
+    SegmentInfos infos = SegmentInfos.readCommit(dir, segmentsFileName);
+    String s = infos.getUserData().get(PRIMARY_GEN_KEY);
+    if (s == null) {
+      return -1;
+    } else {
+      return Long.parseLong(s);
+    }
+  }
+
+  /**
+   * Start this replica node using the last known primary generation, as detected from the last
+   * index commit. Ensures a live primary is not needed to start node.
+   *
+   * @throws IOException on filesystem error
+   */
+  public void startWithLastPrimaryGen() throws IOException {
+    start(getLastPrimaryGen());
+  }
+
+  @Override
+  public synchronized void start(long primaryGen) throws IOException {
+    super.start(primaryGen);
+    if (replicaDeleterManager != null) {
+      replicaDeleterManager.decReplicaInitialCommitFiles();
+    }
+    if (filterIncompatibleSegmentReaders) {
+      // Swap in a SearcherManager that filters incompatible segment readers during refresh.
+      // Updating the reference is not thread safe, but since this happens under the object lock
+      // and before the shard has stared, nothing should access the manager before the swap.
+      mgr = new FilteringSegmentInfosSearcherManager(getDirectory(), this, mgr, searcherFactory);
+    }
   }
 
   @Override
@@ -171,10 +218,7 @@ public class NRTReplicaNode extends ReplicaNode {
   /* called once start(primaryGen) is invoked on this object (see constructor) */
   @Override
   protected void sendNewReplica() throws IOException {
-    logger.info(
-        String.format(
-            "send new_replica to primary host=%s, tcpPort=%s",
-            primaryAddress.getHost(), primaryAddress.getPort()));
+    logger.info(String.format("send new_replica to primary: %s", primaryAddress));
     primaryAddress.addReplicas(indexName, this.id, hostPort.getHostName(), hostPort.getPort());
   }
 
@@ -213,6 +257,11 @@ public class NRTReplicaNode extends ReplicaNode {
     super.close();
   }
 
+  @VisibleForTesting
+  public ReplicaDeleterManager getReplicaDeleterManager() {
+    return replicaDeleterManager;
+  }
+
   public ReplicationServerClient getPrimaryAddress() {
     return primaryAddress;
   }
@@ -236,13 +285,14 @@ public class NRTReplicaNode extends ReplicaNode {
   /**
    * Sync the next nrt point from the current primary. Attempts to get the current index version
    * from the primary, giving up after the specified amount of time. Sync is considered completed
-   * when either the index version has updated to at least the initial primary version, or there is
-   * a failure to start a new copy job.
+   * when either the index version has updated to at least the initial primary version, there is a
+   * failure to start a new copy job, or the specified max time elapses.
    *
    * @param primaryWaitMs how long to wait for primary to be available
+   * @param maxTimeMs max time to attempt initial point sync
    * @throws IOException on issue getting searcher version
    */
-  public void syncFromCurrentPrimary(long primaryWaitMs) throws IOException {
+  public void syncFromCurrentPrimary(long primaryWaitMs, long maxTimeMs) throws IOException {
     logger.info("Starting sync of next nrt point from current primary");
     long startMS = System.currentTimeMillis();
     long primaryIndexVersion = -1;
@@ -270,10 +320,10 @@ public class NRTReplicaNode extends ReplicaNode {
     }
     long curVersion = getCurrentSearchingVersion();
     logger.info("Nrt sync: primary version: {}, my version: {}", primaryIndexVersion, curVersion);
-    // Keep trying to sync a new nrt point until either our searcher version updates, or
-    // we are unable to start a new copy job. This is needed since long running nrt points
-    // may fail if the primary cleans up old commit files.
-    while (curVersion < primaryIndexVersion) {
+    // Keep trying to sync a new nrt point until either we run out of time, our searcher version
+    // updates, or we are unable to start a new copy job. This is needed since long running nrt
+    // points may fail if the primary cleans up old commit files.
+    while (curVersion < primaryIndexVersion && (System.currentTimeMillis() - startMS < maxTimeMs)) {
       CopyJob job = newNRTPoint(lastPrimaryGen, Long.MAX_VALUE);
       if (job == null) {
         logger.info("Nrt sync: failed to start copy job, aborting");

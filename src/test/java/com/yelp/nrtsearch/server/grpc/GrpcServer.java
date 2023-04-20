@@ -17,13 +17,13 @@ package com.yelp.nrtsearch.server.grpc;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.util.JsonFormat;
+import com.yelp.nrtsearch.server.backup.Archiver;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
+import com.yelp.nrtsearch.server.grpc.LuceneServer.LuceneServerImpl;
 import com.yelp.nrtsearch.server.luceneserver.GlobalState;
-import com.yelp.nrtsearch.server.luceneserver.RestoreStateHandler;
 import com.yelp.nrtsearch.server.monitoring.Configuration;
 import com.yelp.nrtsearch.server.monitoring.LuceneServerMonitoringServerInterceptor;
 import com.yelp.nrtsearch.server.plugins.Plugin;
-import com.yelp.nrtsearch.server.utils.Archiver;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
@@ -75,8 +75,7 @@ public class GrpcServer {
       GrpcCleanupRule grpcCleanup,
       LuceneServerConfiguration configuration,
       TemporaryFolder temporaryFolder,
-      boolean isReplication,
-      GlobalState globalState,
+      GlobalState replicationGlobalState,
       String indexDir,
       String index,
       int port,
@@ -86,19 +85,18 @@ public class GrpcServer {
     this.grpcCleanup = grpcCleanup;
     this.temporaryFolder = temporaryFolder;
     this.configuration = configuration;
-    this.globalState = globalState;
+    this.globalState = replicationGlobalState;
     this.indexDir = indexDir;
     this.testIndex = index;
     this.archiver = archiver;
-    invoke(collectorRegistry, isReplication, port, archiver, plugins);
+    invoke(collectorRegistry, replicationGlobalState != null, port, archiver, plugins);
   }
 
   public GrpcServer(
       GrpcCleanupRule grpcCleanup,
       LuceneServerConfiguration configuration,
       TemporaryFolder temporaryFolder,
-      boolean isReplication,
-      GlobalState globalState,
+      GlobalState replicationGlobalState,
       String indexDir,
       String index,
       int port,
@@ -109,8 +107,7 @@ public class GrpcServer {
         grpcCleanup,
         configuration,
         temporaryFolder,
-        isReplication,
-        globalState,
+        replicationGlobalState,
         indexDir,
         index,
         port,
@@ -122,8 +119,7 @@ public class GrpcServer {
       GrpcCleanupRule grpcCleanup,
       LuceneServerConfiguration configuration,
       TemporaryFolder temporaryFolder,
-      boolean isReplication,
-      GlobalState globalState,
+      GlobalState replicationGlobalState,
       String indexDir,
       String index,
       int port)
@@ -132,8 +128,7 @@ public class GrpcServer {
         grpcCleanup,
         configuration,
         temporaryFolder,
-        isReplication,
-        globalState,
+        replicationGlobalState,
         indexDir,
         index,
         port,
@@ -218,13 +213,16 @@ public class GrpcServer {
     if (!isReplication) {
       Server server;
       if (collectorRegistry == null) {
+        LuceneServerImpl serverImpl =
+            new LuceneServer.LuceneServerImpl(
+                configuration, archiver, null, collectorRegistry, plugins);
+        globalState = serverImpl.getGlobalState();
         // Create a server, add service, start, and register for automatic graceful shutdown.
         server =
             ServerBuilder.forPort(port)
-                .addService(
-                    new LuceneServer.LuceneServerImpl(
-                            globalState, configuration, archiver, collectorRegistry, plugins)
-                        .bindService())
+                .addService(serverImpl.bindService())
+                .compressorRegistry(LuceneServerStubBuilder.COMPRESSOR_REGISTRY)
+                .decompressorRegistry(LuceneServerStubBuilder.DECOMPRESSOR_REGISTRY)
                 .build()
                 .start();
       } else {
@@ -235,14 +233,16 @@ public class GrpcServer {
                 Configuration.allMetrics().withCollectorRegistry(collectorRegistry),
                 serviceName,
                 nodeName);
+        LuceneServerImpl serverImpl =
+            new LuceneServer.LuceneServerImpl(
+                configuration, archiver, null, collectorRegistry, plugins);
+        globalState = serverImpl.getGlobalState();
         // Create a server, add service, start, and register for automatic graceful shutdown.
         server =
             ServerBuilder.forPort(port)
-                .addService(
-                    ServerInterceptors.intercept(
-                        new LuceneServer.LuceneServerImpl(
-                            globalState, configuration, archiver, collectorRegistry, plugins),
-                        monitoringInterceptor))
+                .addService(ServerInterceptors.intercept(serverImpl, monitoringInterceptor))
+                .compressorRegistry(LuceneServerStubBuilder.COMPRESSOR_REGISTRY)
+                .decompressorRegistry(LuceneServerStubBuilder.DECOMPRESSOR_REGISTRY)
                 .build()
                 .start();
       }
@@ -266,6 +266,8 @@ public class GrpcServer {
       Server server =
           ServerBuilder.forPort(port)
               .addService(new LuceneServer.ReplicationServerImpl(globalState))
+              .compressorRegistry(LuceneServerStubBuilder.COMPRESSOR_REGISTRY)
+              .decompressorRegistry(LuceneServerStubBuilder.DECOMPRESSOR_REGISTRY)
               .build()
               .start();
       grpcCleanup.register(server);
@@ -311,6 +313,7 @@ public class GrpcServer {
     public AddDocumentResponse addDocumentResponse;
     public boolean completed = false;
     public boolean error = false;
+    public Throwable throwable = null;
 
     public TestServer(
         GrpcServer grpcServer, boolean startIndex, Mode mode, int primaryGen, boolean startOldIndex)
@@ -339,7 +342,9 @@ public class GrpcServer {
         throws IOException, InterruptedException {
       Stream<AddDocumentRequest> addDocumentRequestStream = getAddDocumentRequestStream(fileName);
       addDocumentsFromStream(addDocumentRequestStream);
-      refresh();
+      if (!error) {
+        refresh();
+      }
       return addDocumentResponse;
     }
 
@@ -357,6 +362,7 @@ public class GrpcServer {
             @Override
             public void onError(Throwable t) {
               error = true;
+              throwable = t;
               finishLatch.countDown();
             }
 
@@ -449,27 +455,22 @@ public class GrpcServer {
         startIndexBuilder.setPort(9001); // primary port for replication server
       }
       if (startOldIndex) {
+        blockingStub.createIndex(CreateIndexRequest.newBuilder().setIndexName(testIndex).build());
         RestoreIndex restoreIndex =
             RestoreIndex.newBuilder()
                 .setServiceName("testservice")
                 .setResourceName("testresource")
                 .build();
         startIndexBuilder.setRestore(restoreIndex);
-        RestoreStateHandler.restore(
-            grpcServer.getArchiver(), grpcServer.getGlobalState(), "testservice");
       }
       blockingStub.startIndex(startIndexBuilder.build());
 
-      if (!startOldIndex) {
-        String registerFields =
-            registerFieldsFileName == null ? "registerFieldsBasic.json" : registerFieldsFileName;
-        // register the fields
-        FieldDefRequest fieldDefRequest =
-            buildFieldDefRequest(Paths.get("src", "test", "resources", registerFields));
-        return blockingStub.registerFields(fieldDefRequest);
-      } else { // dummy
-        return FieldDefResponse.newBuilder().build();
-      }
+      String registerFields =
+          registerFieldsFileName == null ? "registerFieldsBasic.json" : registerFieldsFileName;
+      // register the fields
+      FieldDefRequest fieldDefRequest =
+          buildFieldDefRequest(Paths.get("src", "test", "resources", registerFields));
+      return blockingStub.registerFields(fieldDefRequest);
     }
 
     private FieldDefRequest buildFieldDefRequest(Path filePath) throws IOException {
