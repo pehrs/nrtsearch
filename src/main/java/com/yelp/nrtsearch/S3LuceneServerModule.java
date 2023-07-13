@@ -26,11 +26,11 @@ import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.google.inject.Inject;
 import com.google.inject.Provides;
 import com.google.inject.Singleton;
+import com.yelp.nrtsearch.server.backup.Archiver;
+import com.yelp.nrtsearch.server.backup.ArchiverImpl;
+import com.yelp.nrtsearch.server.backup.Tar;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
 import com.yelp.nrtsearch.server.grpc.LuceneServer.LuceneServerCommand;
-import com.yelp.nrtsearch.server.utils.Archiver;
-import com.yelp.nrtsearch.server.utils.ArchiverImpl;
-import com.yelp.nrtsearch.server.utils.Tar;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 

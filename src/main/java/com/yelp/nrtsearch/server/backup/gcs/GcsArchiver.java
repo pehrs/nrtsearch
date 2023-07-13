@@ -13,15 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.yelp.nrtsearch.server.utils.gcs;
+package com.yelp.nrtsearch.server.backup.gcs;
 
 import com.google.inject.Inject;
-import com.yelp.nrtsearch.server.utils.Archiver;
-import com.yelp.nrtsearch.server.utils.Tar;
-import com.yelp.nrtsearch.server.utils.Tar.CompressionMode;
-import com.yelp.nrtsearch.server.utils.VersionedResource;
-import com.yelp.nrtsearch.server.utils.gcs.GcsStorageApi.GcsBlob;
-import com.yelp.nrtsearch.server.utils.gcs.GcsStorageApi.GcsBlobId;
+import com.yelp.nrtsearch.server.backup.Archiver;
+import com.yelp.nrtsearch.server.backup.Tar;
+import com.yelp.nrtsearch.server.backup.Tar.CompressionMode;
+import com.yelp.nrtsearch.server.backup.VersionedResource;
+import com.yelp.nrtsearch.server.backup.gcs.GcsStorageApi.GcsBlob;
+import com.yelp.nrtsearch.server.backup.gcs.GcsStorageApi.GcsBlobId;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -213,6 +213,12 @@ public class GcsArchiver implements Archiver {
       throws IOException {
     // FIXME:
     return false;
+  }
+
+  @Override
+  public boolean deleteLocalFiles(String resource) {
+    // FIXME:
+    return true;
   }
 
   @Override

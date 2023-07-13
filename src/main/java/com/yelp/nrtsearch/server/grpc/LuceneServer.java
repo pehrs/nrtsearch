@@ -34,7 +34,6 @@ import com.google.protobuf.Empty;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.util.JsonFormat;
 import com.yelp.nrtsearch.GCSLuceneServerModule;
-import com.yelp.nrtsearch.LuceneServerModule;
 import com.yelp.nrtsearch.S3LuceneServerModule;
 import com.yelp.nrtsearch.server.MetricsRequestHandler;
 import com.yelp.nrtsearch.server.backup.Archiver;
@@ -293,7 +292,7 @@ public class LuceneServer {
     }
 
     private Injector createInjector() {
-      if(this.useGCS) {
+      if (this.useGCS) {
         return Guice.createInjector(new GCSLuceneServerModule(this));
       } else {
         // Guice.createInjector(new LuceneServerModule(this));

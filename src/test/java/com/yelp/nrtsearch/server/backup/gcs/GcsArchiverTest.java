@@ -13,19 +13,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.yelp.nrtsearch.server.utils.gcs;
+package com.yelp.nrtsearch.server.backup.gcs;
 
 import static com.yelp.nrtsearch.server.grpc.GrpcServer.rmDir;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import com.amazonaws.util.IOUtils;
-import com.yelp.nrtsearch.server.utils.Archiver;
-import com.yelp.nrtsearch.server.utils.Tar.CompressionMode;
-import com.yelp.nrtsearch.server.utils.TarEntry;
-import com.yelp.nrtsearch.server.utils.TarImpl;
-import com.yelp.nrtsearch.server.utils.TarImplTest;
-import com.yelp.nrtsearch.server.utils.gcs.GcsStorageApi.GcsBlobId;
+import com.yelp.nrtsearch.server.backup.Archiver;
+import com.yelp.nrtsearch.server.backup.Tar.CompressionMode;
+import com.yelp.nrtsearch.server.backup.TarEntry;
+import com.yelp.nrtsearch.server.backup.TarImpl;
+import com.yelp.nrtsearch.server.backup.TarImplTest;
+import com.yelp.nrtsearch.server.backup.gcs.GcsStorageApi.GcsBlobId;
 import java.io.ByteArrayInputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;

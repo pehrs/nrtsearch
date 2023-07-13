@@ -20,12 +20,12 @@ import com.google.cloud.storage.StorageOptions;
 import com.google.inject.Inject;
 import com.google.inject.Provides;
 import com.google.inject.Singleton;
+import com.yelp.nrtsearch.server.backup.Archiver;
+import com.yelp.nrtsearch.server.backup.Tar;
+import com.yelp.nrtsearch.server.backup.gcs.GcsArchiver;
+import com.yelp.nrtsearch.server.backup.gcs.GcsStorageImpl;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
 import com.yelp.nrtsearch.server.grpc.LuceneServer.LuceneServerCommand;
-import com.yelp.nrtsearch.server.utils.Archiver;
-import com.yelp.nrtsearch.server.utils.Tar;
-import com.yelp.nrtsearch.server.utils.gcs.GcsArchiver;
-import com.yelp.nrtsearch.server.utils.gcs.GcsStorageImpl;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
@@ -55,7 +55,6 @@ public class GCSLuceneServerModule extends LuceneServerModule {
     // Just use the default service for now
     return StorageOptions.getDefaultInstance().getService();
   }
-
 
   @Inject
   @Singleton

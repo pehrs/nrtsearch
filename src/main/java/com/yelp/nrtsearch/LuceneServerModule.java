@@ -21,12 +21,7 @@ import com.google.inject.Provides;
 import com.google.inject.Singleton;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
 import com.yelp.nrtsearch.server.grpc.LuceneServer;
-<<<<<<< HEAD
-import com.yelp.nrtsearch.server.utils.Tar;
-import com.yelp.nrtsearch.server.utils.TarImpl;
-=======
 import com.yelp.nrtsearch.server.module.S3Module;
->>>>>>> master
 import io.prometheus.client.CollectorRegistry;
 import java.io.File;
 import java.io.FileInputStream;
