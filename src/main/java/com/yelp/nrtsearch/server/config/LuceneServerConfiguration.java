@@ -45,6 +45,7 @@ public class LuceneServerConfiguration {
   private static final Path DEFAULT_INDEX_DIR =
       Paths.get(DEFAULT_USER_DIR.toString(), "default_index");
   private static final String DEFAULT_BUCKET_NAME = "DEFAULT_ARCHIVE_BUCKET";
+  static final int DEFAULT_MAX_S3_CLIENT_RETRIES = 20;
   private static final String DEFAULT_HOSTNAME = "localhost";
   private static final int DEFAULT_PORT = 50051;
   private static final int DEFAULT_REPLICATION_PORT = 50052;
@@ -71,6 +72,7 @@ public class LuceneServerConfiguration {
   private final String archiveDirectory;
   private final String botoCfgPath;
   private final String bucketName;
+  private final int maxS3ClientRetries;
   private final double[] metricsBuckets;
   private final boolean publishJvmMetrics;
   private final String[] plugins;
@@ -103,6 +105,9 @@ public class LuceneServerConfiguration {
   private final YamlConfigReader configReader;
   private final long maxConnectionAgeForReplication;
   private final long maxConnectionAgeGraceForReplication;
+  private final boolean savePluginBeforeUnzip;
+
+  private final boolean enableGlobalBucketAccess;
 
   @Inject
   public LuceneServerConfiguration(InputStream yamlStream) {
@@ -127,6 +132,8 @@ public class LuceneServerConfiguration {
     archiveDirectory = configReader.getString("archiveDirectory", DEFAULT_ARCHIVER_DIR.toString());
     botoCfgPath = configReader.getString("botoCfgPath", DEFAULT_BOTO_CFG_PATH.toString());
     bucketName = configReader.getString("bucketName", DEFAULT_BUCKET_NAME);
+    maxS3ClientRetries =
+        configReader.getInteger("maxS3ClientRetries", DEFAULT_MAX_S3_CLIENT_RETRIES);
     double[] metricsBuckets;
     try {
       List<Double> bucketList = configReader.getDoubleList("metricsBuckets");
@@ -172,6 +179,8 @@ public class LuceneServerConfiguration {
         FSTLoadMode.valueOf(configReader.getString("completionCodecLoadMode", "ON_HEAP"));
     filterIncompatibleSegmentReaders =
         configReader.getBoolean("filterIncompatibleSegmentReaders", false);
+    savePluginBeforeUnzip = configReader.getBoolean("savePluginBeforeUnzip", false);
+    enableGlobalBucketAccess = configReader.getBoolean("enableGlobalBucketAccess", false);
   }
 
   public ThreadPoolConfiguration getThreadPoolConfiguration() {
@@ -216,6 +225,11 @@ public class LuceneServerConfiguration {
 
   public String getBucketName() {
     return bucketName;
+  }
+
+  /** Get max number of retries to configure for s3 client. If <= 0, use client default. */
+  public int getMaxS3ClientRetries() {
+    return maxS3ClientRetries;
   }
 
   public String getArchiveDirectory() {
@@ -332,6 +346,14 @@ public class LuceneServerConfiguration {
 
   public boolean getFilterIncompatibleSegmentReaders() {
     return filterIncompatibleSegmentReaders;
+  }
+
+  public boolean getSavePluginBeforeUnzip() {
+    return savePluginBeforeUnzip;
+  }
+
+  public boolean getEnableGlobalBucketAccess() {
+    return enableGlobalBucketAccess;
   }
 
   /**

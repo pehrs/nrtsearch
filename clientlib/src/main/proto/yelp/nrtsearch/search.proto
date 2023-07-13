@@ -214,6 +214,8 @@ message MultiMatchQuery {
         BEST_FIELDS = 0;
         // Runs a MatchPhrasePrefixQuery query on each field and uses the _score from the best field.
         PHRASE_PREFIX = 1;
+        // Finds documents that match across multiple fields, as if they were a single field.
+        CROSS_FIELDS = 2;
     }
 
     repeated string fields = 1; // Fields in the document to query.
@@ -314,6 +316,8 @@ message MultiFunctionScoreQuery {
         BOOST_MODE_MULTIPLY = 0;
         // Add scores together
         BOOST_MODE_SUM = 1;
+        // Ignore the query score, and use the function score only
+        BOOST_MODE_REPLACE = 2;
     }
 
     // Main query to produce recalled docs and scores, which will be modified by the final function score
@@ -324,6 +328,16 @@ message MultiFunctionScoreQuery {
     FunctionScoreMode score_mode = 3;
     // Method to modify query document scores with final function score
     BoostMode boost_mode = 4;
+    // Optional minimal score to match a document. By default, it's 0.
+    float min_score = 5;
+    // Determine minimal score is excluded or not. By default, it's false;
+    bool min_excluded = 6;
+}
+
+// Query that produces a score of 1.0 (modifiable by query boost value) for documents that match the filter query.
+message ConstantScoreQuery {
+    // Query to determine matching documents
+    Query filter = 1;
 }
 
 // Defines different types of QueryNodes.
@@ -348,6 +362,7 @@ enum QueryType {
     MULTI_FUNCTION_SCORE_QUERY = 17;
     MATCH_PHRASE_PREFIX = 18;
     PREFIX = 19;
+    CONSTANT_SCORE_QUERY = 20;
 }
 
 // Defines a full query consisting of a QueryNode which may be one of several types.
@@ -376,6 +391,7 @@ message Query {
         MultiFunctionScoreQuery multiFunctionScoreQuery = 20;
         MatchPhrasePrefixQuery matchPhrasePrefixQuery = 21;
         PrefixQuery prefixQuery = 22;
+        ConstantScoreQuery constantScoreQuery = 23;
     }
 }
 
@@ -414,6 +430,28 @@ message SearchRequest {
     string responseCompression = 23;
     // Specify how to highlight matched text
     Highlight highlight = 24;
+    // If Lucene explanation should be included in the response
+    bool explain = 25;
+    // Search nested object fields for each hit
+    map<string, InnerHit> inner_hits = 26;
+}
+
+/* Inner Hit search request */
+message InnerHit {
+    // Nested path to search against assuming same index as the parent Query.
+    string query_nested_path = 1;
+    // Which hit to start from (for pagination); default: 0
+    int32 start_hit = 2;
+    // How many top hits to retrieve; default: 3. It limits the hits returned, starting from index 0. For pagination: set it to startHit + window_size.
+    int32 top_hits = 3;
+    // InnerHit query to query against the nested documents specified by queryNestedPath.
+    Query inner_query = 4;
+    // Fields to retrieve; Parent's fields except its id field are unavailable in the innerHit.
+    repeated string retrieve_fields = 5;
+    // Sort hits by field (default is by relevance).
+    QuerySortField query_sort = 6;
+    // Highlight the children documents.
+    Highlight highlight = 7;
 }
 
 /* Virtual field used during search */
@@ -524,6 +562,7 @@ message SearchResponse {
         map<string, double> facetTimeMs = 9;
         double rescoreTimeMs = 10;
         map<string, double> rescorersTimeMs = 11;
+        map<string, Diagnostics> innerHitsDiagnostics = 12;
     }
 
     message Hit {
@@ -562,6 +601,10 @@ message SearchResponse {
         map<string, CompositeFieldValue> sortedFields = 4; // Sorted field name to value
         // Field name to highlighted text fragments
         map<string, Highlights> highlights = 5;
+        // Lucene explanation of the hit
+        string explain = 6;
+        // InnerHits for each hit
+        map<string, HitsResult> innerHits = 7;
     }
 
     message SearchState {
@@ -706,6 +749,8 @@ message Collector {
         TopHitsCollector topHitsCollector = 4;
         //Collector that filters documents to nested collectors
         FilterCollector filter = 5;
+        //Collector for finding a max double value from collected documents.
+        MaxCollector max = 6;
     }
     //Nested collectors that define sub-aggregations per bucket, supported by bucket based collectors.
     map<string, Collector> nestedCollectors = 3;
@@ -727,6 +772,8 @@ message TermsCollector {
     }
     //Maximum number of top terms to return.
     int32 size = 3;
+    //How results Buckets should be ordered, defaults to descending Bucket _count.
+    BucketOrder order = 4;
 }
 
 //Definition of top hits based collector.
@@ -739,6 +786,8 @@ message TopHitsCollector {
     QuerySortField querySort = 3;
     //Which fields to retrieve.
     repeated string retrieveFields = 4;
+    // If Lucene explanation should be included in the collector response
+    bool explain = 5;
 }
 
 //Definition of filtering collector, there must be at least one nested collector specified in the Collector message.
@@ -748,6 +797,14 @@ message FilterCollector {
         Query query = 1;
         // Specialized implementation for set queries, checks if field doc values are in the provided set. This can be useful for large set sizes with lower recall, where building the scorer would be expensive.
         TermInSetQuery setQuery = 2;
+    }
+}
+
+//Definition of collector to find a max double value over documents. Currently only allows for script based value production.
+message MaxCollector {
+    oneof ValueSource {
+        //Script to produce a double value
+        Script script = 1;
     }
 }
 
@@ -761,7 +818,22 @@ message CollectorResult {
         HitsResult hitsResult = 4;
         //Result of collector that filters documents.
         FilterResult filterResult = 5;
+        //Result of collector that produces a single double value.
+        google.protobuf.DoubleValue doubleResult = 6;
     }
+}
+
+//Defines how Buckets should be ordered in BucketResult.
+message BucketOrder {
+    //Sorting order type
+    enum OrderType {
+        DESC = 0;
+        ASC = 1;
+    }
+    //What to use for sorting. This can be _count for Bucket count, or the name of a nested collector that supports ordering.
+    string key = 1;
+    //Sorting order
+    OrderType order = 2;
 }
 
 message BucketResult {
@@ -796,25 +868,47 @@ message FilterResult {
 message Highlight {
 
     enum Type {
+        // When DEFAULT is set in global setting, use fast vector highlighter; when set for field setting, use the type from the global setting.
         DEFAULT = 0;
         FAST_VECTOR = 1;
+        // not supported yet
+        PLAIN = 2;
+        CUSTOM = 3;
     }
 
     message Settings {
         // Specify type of highlighter to use. Ignored right now in nrtsearch.
         Type highlighter_type = 1;
-        // Used along with post_tags to specify how to wrap the highlighted text
+        // Used along with post_tags to specify how to wrap the highlighted text.
         repeated string pre_tags = 2;
-        // Used along with pre_tags to specify how to wrap the highlighted text
+        // Used along with pre_tags to specify how to wrap the highlighted text.
         repeated string post_tags = 3;
-        // Number of characters in highlighted fragment, 100 by default
+        // Number of characters in highlighted fragment, 100 by default. Set it to be 0 to fetch the entire field.
         google.protobuf.UInt32Value fragment_size = 4;
         // Maximum number of highlight fragments to return, 5 by default. If set to 0 returns entire text as a single fragment ignoring fragment_size.
         google.protobuf.UInt32Value max_number_of_fragments = 5;
-        // Specify a query here if highlighting is desired against a different query than the search query
+        // Specify a query here if highlighting is desired against a different query than the search query.
         Query highlight_query = 6;
-        // Set to true to highlight fields only if specified in the search query
-        bool field_match = 7;
+        // Set to true to highlight fields only if specified in the search query.
+        google.protobuf.BoolValue field_match = 7;
+        // Sorts highlighted fragments by score when set to true. By default, fragments will be output in the order they appear in the field. (Default is true)
+        google.protobuf.BoolValue score_ordered = 8;
+        // Select Fragmenter between span (default) and simple. This is only applicable for plain highlighters.
+        google.protobuf.StringValue fragmenter = 9;
+        // Let the fragment builder respect the multivalue fields. Each fragment won't cross multiple value fields if set true. (Default is false)
+        google.protobuf.BoolValue discrete_multivalue = 10;
+        // When highlighter_type is CUSTOM, use this string identifier to specify the highlighter. It is ignored for any other highlighter_types.
+        string custom_highlighter_name = 11;
+        // Optional Custom parameters for custom highlighters. If a field overriding is present, the global setting will be omitted for this field, and no merge will happen.
+        google.protobuf.Struct custom_highlighter_params = 12;
+        // Define the boundary decision when creating fragments. Options are "simple" (default in fast vector highlighter), "word" or "sentence".
+        google.protobuf.StringValue  boundary_scanner = 13;
+        // Terminating chars when using "simple" boundary_scanner. The default is ".,!? \t\n".
+        google.protobuf.StringValue  boundary_chars = 14;
+        // Number of chars to scan before finding the boundary_chars if using "simple" boundary scanner; If "boundary_chars" is not found after max scan, fragments will start/end at the original place. Default is 20.
+        google.protobuf.UInt32Value  boundary_max_scan = 15;
+        // Locale used in boundary scanner when using "word" or "sentence" boundary_scanner. Examples: "en-US", "ch-ZH".
+        google.protobuf.StringValue  boundary_scanner_locale = 16;
     }
 
     // Highlight settings

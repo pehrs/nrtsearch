@@ -15,11 +15,13 @@
  */
 package com.yelp.nrtsearch.server.luceneserver.search.collectors;
 
+import com.yelp.nrtsearch.server.collectors.BucketOrder;
 import com.yelp.nrtsearch.server.config.LuceneServerConfiguration;
 import com.yelp.nrtsearch.server.grpc.Collector;
 import com.yelp.nrtsearch.server.grpc.CollectorResult;
 import com.yelp.nrtsearch.server.grpc.PluginCollector;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.additional.FilterCollectorManager;
+import com.yelp.nrtsearch.server.luceneserver.search.collectors.additional.MaxCollectorManager;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.additional.TermsCollectorManager;
 import com.yelp.nrtsearch.server.luceneserver.search.collectors.additional.TopHitsCollectorManager;
 import com.yelp.nrtsearch.server.plugins.CollectorPlugin;
@@ -74,9 +76,17 @@ public class CollectorCreator {
                     e -> createCollectorManagerSupplier(context, e.getKey(), e.getValue())));
     switch (collector.getCollectorsCase()) {
       case TERMS:
+        BucketOrder bucketOrder;
+        if (collector.getTerms().hasOrder()) {
+          bucketOrder =
+              BucketOrder.createBucketOrder(
+                  collector.getTerms().getOrder(), collector.getNestedCollectorsMap());
+        } else {
+          bucketOrder = BucketOrder.DEFAULT_ORDER;
+        }
         return () ->
             TermsCollectorManager.buildManager(
-                name, collector.getTerms(), context, nestedCollectorSuppliers);
+                name, collector.getTerms(), context, nestedCollectorSuppliers, bucketOrder);
       case PLUGINCOLLECTOR:
         PluginCollector pluginCollector = collector.getPluginCollector();
         CollectorProvider<?> provider = collectorsMap.get(pluginCollector.getName());
@@ -99,6 +109,11 @@ public class CollectorCreator {
         return () ->
             new FilterCollectorManager(
                 name, collector.getFilter(), context, nestedCollectorSuppliers);
+      case MAX:
+        if (!nestedCollectorSuppliers.isEmpty()) {
+          throw new IllegalArgumentException("MaxCollector cannot have nested collectors");
+        }
+        return () -> new MaxCollectorManager(name, collector.getMax(), context);
       default:
         throw new IllegalArgumentException(
             "Unknown Collector type: " + collector.getCollectorsCase());

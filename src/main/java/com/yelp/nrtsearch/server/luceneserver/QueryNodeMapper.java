@@ -26,21 +26,25 @@ import com.yelp.nrtsearch.server.grpc.MatchOperator;
 import com.yelp.nrtsearch.server.grpc.MatchPhraseQuery;
 import com.yelp.nrtsearch.server.grpc.MatchQuery;
 import com.yelp.nrtsearch.server.grpc.MultiMatchQuery;
+import com.yelp.nrtsearch.server.grpc.MultiMatchQuery.MatchType;
 import com.yelp.nrtsearch.server.grpc.PrefixQuery;
 import com.yelp.nrtsearch.server.grpc.RangeQuery;
 import com.yelp.nrtsearch.server.grpc.RewriteMethod;
 import com.yelp.nrtsearch.server.luceneserver.analysis.AnalyzerCreator;
 import com.yelp.nrtsearch.server.luceneserver.field.FieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.IndexableFieldDef;
+import com.yelp.nrtsearch.server.luceneserver.field.TextBaseFieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.properties.GeoQueryable;
 import com.yelp.nrtsearch.server.luceneserver.field.properties.PolygonQueryable;
 import com.yelp.nrtsearch.server.luceneserver.field.properties.RangeQueryable;
 import com.yelp.nrtsearch.server.luceneserver.field.properties.TermQueryable;
 import com.yelp.nrtsearch.server.luceneserver.script.ScoreScript;
 import com.yelp.nrtsearch.server.luceneserver.script.ScriptService;
+import com.yelp.nrtsearch.server.luceneserver.search.query.MatchCrossFieldsQuery;
 import com.yelp.nrtsearch.server.luceneserver.search.query.MatchPhrasePrefixQuery;
 import com.yelp.nrtsearch.server.luceneserver.search.query.multifunction.MultiFunctionScoreQuery;
 import com.yelp.nrtsearch.server.utils.ScriptParamsUtils;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.EnumMap;
@@ -104,14 +108,21 @@ public class QueryNodeMapper {
     return queryNode;
   }
 
-  public Query applyQueryNestedPath(Query query, String path) {
-    if (path == null || path.length() == 0) {
-      path = IndexState.ROOT;
+  public Query applyQueryNestedPath(Query query, IndexState indexState, String path) {
+    if (path == null || path.isEmpty()) {
+      return query;
     }
     BooleanQuery.Builder builder = new BooleanQuery.Builder();
-    builder.add(new TermQuery(new Term(IndexState.NESTED_PATH, path)), BooleanClause.Occur.FILTER);
+    builder.add(getNestedPathQuery(indexState, path), BooleanClause.Occur.FILTER);
     builder.add(query, BooleanClause.Occur.MUST);
     return builder.build();
+  }
+
+  /*
+   * create the query to filter the parent/child document based on the path
+   * */
+  public Query getNestedPathQuery(IndexState indexState, String path) {
+    return new TermQuery(new Term(IndexState.NESTED_PATH, indexState.resolveQueryNestedPath(path)));
   }
 
   private Query getQueryNode(com.yelp.nrtsearch.server.grpc.Query query, IndexState state) {
@@ -156,6 +167,8 @@ public class QueryNodeMapper {
         return MatchPhrasePrefixQuery.build(query.getMatchPhrasePrefixQuery(), state);
       case PREFIXQUERY:
         return getPrefixQuery(query.getPrefixQuery(), state);
+      case CONSTANTSCOREQUERY:
+        return getConstantScoreQuery(query.getConstantScoreQuery(), state);
       case QUERYNODE_NOT_SET:
         return new MatchAllDocsQuery();
       default:
@@ -194,12 +207,10 @@ public class QueryNodeMapper {
     Query childRawQuery = getQuery(nestedQuery.getQuery(), state);
     Query childQuery =
         new BooleanQuery.Builder()
-            .add(
-                new TermQuery(new Term(IndexState.NESTED_PATH, nestedQuery.getPath())),
-                BooleanClause.Occur.FILTER)
+            .add(getNestedPathQuery(state, nestedQuery.getPath()), BooleanClause.Occur.FILTER)
             .add(childRawQuery, BooleanClause.Occur.MUST)
             .build();
-    Query parentQuery = new TermQuery(new Term(IndexState.NESTED_PATH, IndexState.ROOT));
+    Query parentQuery = getNestedPathQuery(state, IndexState.ROOT);
     return new ToParentBlockJoinQuery(
         childQuery, new QueryBitSetProducer(parentQuery), getScoreMode(nestedQuery));
   }
@@ -391,6 +402,10 @@ public class QueryNodeMapper {
       fields = multiMatchQuery.getFieldsList();
     }
 
+    if (multiMatchQuery.getType() == MatchType.CROSS_FIELDS) {
+      return getMultiMatchCrossFieldsQuery(fields, multiMatchQuery, state);
+    }
+
     List<Query> matchQueries =
         fields.stream()
             .map(
@@ -445,6 +460,38 @@ public class QueryNodeMapper {
                 })
             .collect(Collectors.toList());
     return new DisjunctionMaxQuery(matchQueries, 0);
+  }
+
+  private Query getMultiMatchCrossFieldsQuery(
+      Collection<String> fields, MultiMatchQuery multiMatchQuery, IndexState state) {
+    Analyzer analyzer = null;
+    for (String field : fields) {
+      FieldDef fieldDef = state.getField(field);
+      if (!(fieldDef instanceof TextBaseFieldDef)) {
+        throw new IllegalArgumentException("Field must be analyzable: " + field);
+      }
+      TextBaseFieldDef textBaseFieldDef = (TextBaseFieldDef) fieldDef;
+      if (!textBaseFieldDef.isSearchable()) {
+        throw new IllegalArgumentException("Field must be searchable: " + field);
+      }
+      if (analyzer == null) {
+        analyzer =
+            multiMatchQuery.hasAnalyzer()
+                ? AnalyzerCreator.getInstance().getAnalyzer(multiMatchQuery.getAnalyzer())
+                : textBaseFieldDef.getSearchAnalyzer().orElse(null);
+      }
+    }
+    if (analyzer == null) {
+      throw new IllegalArgumentException("Could not determine analyzer for query");
+    }
+    return MatchCrossFieldsQuery.build(
+        multiMatchQuery.getQuery(),
+        new ArrayList<>(fields),
+        multiMatchQuery.getFieldBoostsMap(),
+        multiMatchQuery.getOperator(),
+        multiMatchQuery.getMinimumNumberShouldMatch(),
+        multiMatchQuery.getTieBreakerMultiplier(),
+        analyzer);
   }
 
   private Query getRangeQuery(RangeQuery rangeQuery, IndexState state) {
@@ -543,5 +590,12 @@ public class QueryNodeMapper {
       default:
         throw new IllegalArgumentException("Unknown rewrite method: " + rewriteMethodGrpc);
     }
+  }
+
+  private Query getConstantScoreQuery(
+      com.yelp.nrtsearch.server.grpc.ConstantScoreQuery constantScoreQueryGrpc,
+      IndexState indexState) {
+    Query filterQuery = getQuery(constantScoreQueryGrpc.getFilter(), indexState);
+    return new ConstantScoreQuery(filterQuery);
   }
 }

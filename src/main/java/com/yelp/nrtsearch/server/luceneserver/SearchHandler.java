@@ -38,6 +38,7 @@ import com.yelp.nrtsearch.server.luceneserver.field.IndexableFieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.ObjectFieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.PolygonfieldDef;
 import com.yelp.nrtsearch.server.luceneserver.field.VirtualFieldDef;
+import com.yelp.nrtsearch.server.luceneserver.innerhit.InnerHitFetchTask;
 import com.yelp.nrtsearch.server.luceneserver.rescore.RescoreTask;
 import com.yelp.nrtsearch.server.luceneserver.search.FieldFetchContext;
 import com.yelp.nrtsearch.server.luceneserver.search.SearchContext;
@@ -58,6 +59,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 import org.apache.lucene.facet.DrillDownQuery;
 import org.apache.lucene.facet.DrillSideways;
 import org.apache.lucene.facet.taxonomy.SearcherTaxonomyManager;
@@ -66,6 +68,7 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.DoubleValues;
+import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.search.ScoreDoc;
@@ -176,6 +179,14 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
         hits = searcherResult.getTopDocs();
       }
 
+      List<Explanation> explanations = null;
+      if (searchRequest.getExplain()) {
+        explanations = new ArrayList<>();
+        for (ScoreDoc doc : hits.scoreDocs) {
+          explanations.add(s.searcher.explain(searchContext.getQuery(), doc.doc));
+        }
+      }
+
       // add results from any extra collectors
       searchContext
           .getResponseBuilder()
@@ -213,7 +224,7 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
       hits = getHitsFromOffset(hits, searchContext.getStartHit(), searchContext.getTopHits());
 
       // create Hit.Builder for each hit, and populate with lucene doc id and ranking info
-      setResponseHits(searchContext, hits);
+      setResponseHits(searchContext, hits, explanations);
 
       // fill Hit.Builder with requested fields
       fetchFields(searchContext);
@@ -234,8 +245,18 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
       searchContext.getResponseBuilder().setSearchState(searchState);
 
       diagnostics.setGetFieldsTimeMs(((System.nanoTime() - t0) / 1000000.0));
-      if (searchContext.getHighlightFetchTask() != null) {
-        diagnostics.setHighlightTimeMs(searchContext.getHighlightFetchTask().getTimeTakenMs());
+
+      if (searchContext.getFetchTasks().getHighlightFetchTask() != null) {
+        diagnostics.setHighlightTimeMs(
+            searchContext.getFetchTasks().getHighlightFetchTask().getTimeTakenMs());
+      }
+      if (searchContext.getFetchTasks().getInnerHitFetchTaskList() != null) {
+        diagnostics.putAllInnerHitsDiagnostics(
+            searchContext.getFetchTasks().getInnerHitFetchTaskList().stream()
+                .collect(
+                    Collectors.toMap(
+                        task -> task.getInnerHitContext().getInnerHitName(),
+                        InnerHitFetchTask::getDiagnostic)));
       }
       searchContext.getResponseBuilder().setDiagnostics(diagnostics);
 
@@ -364,10 +385,6 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
         var hitResponse = hitBuilders.get(hitIndex);
         LeafReaderContext leaf = hitIdToLeaves.get(hitIndex);
         searchContext.getFetchTasks().processHit(searchContext, leaf, hitResponse);
-        // TODO: combine with custom fetch tasks
-        if (searchContext.getHighlightFetchTask() != null) {
-          searchContext.getHighlightFetchTask().processHit(searchContext, leaf, hitResponse);
-        }
       }
     } else if (!parallelFetchByField
         && fetch_thread_pool_size > 1
@@ -440,7 +457,8 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
    * @param context search context
    * @param hits hits from query
    */
-  private static void setResponseHits(SearchContext context, TopDocs hits) {
+  private static void setResponseHits(
+      SearchContext context, TopDocs hits, List<Explanation> explanations) {
     TotalHits totalHits =
         TotalHits.newBuilder()
             .setRelation(TotalHits.Relation.valueOf(hits.totalHits.relation.name()))
@@ -452,6 +470,9 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
       ScoreDoc hit = hits.scoreDocs[hitIndex];
       hitResponse.setLuceneDocId(hit.doc);
       context.getCollector().fillHitRanking(hitResponse, hit);
+      if (explanations != null) {
+        hitResponse.setExplain(explanations.get(hitIndex).toString());
+      }
     }
   }
 
@@ -890,13 +911,6 @@ public class SearchHandler implements Handler<SearchRequest, SearchResponse> {
       // execute any per hit fetch tasks
       for (Hit.Builder hit : sliceHits) {
         context.getFetchTasks().processHit(context.getSearchContext(), sliceSegment, hit);
-        // TODO: combine with custom fetch tasks
-        if (context.getSearchContext().getHighlightFetchTask() != null) {
-          context
-              .getSearchContext()
-              .getHighlightFetchTask()
-              .processHit(context.getSearchContext(), sliceSegment, hit);
-        }
       }
     }
 

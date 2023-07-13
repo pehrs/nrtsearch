@@ -149,6 +149,9 @@ public class TopHitsCollectorManager
   @Override
   public void setSearchContext(SearchContext searchContext) {
     this.searchContext = searchContext;
+    // Backward compatibility: We reuse the highlightFetchTask from the SearchContext
+    this.retrievalContext.fetchTasks.setHighlightFetchTask(
+        searchContext.getFetchTasks().getHighlightFetchTask());
   }
 
   @Override
@@ -196,6 +199,22 @@ public class TopHitsCollectorManager
     hitBuilders.sort(Comparator.comparing(Hit.Builder::getLuceneDocId));
 
     new SearchHandler.FillDocsTask(retrievalContext, hitBuilders).run();
+
+    if (grpcTopHitsCollector.getExplain()) {
+      hitBuilders.forEach(
+          hitBuilder -> {
+            try {
+              hitBuilder.setExplain(
+                  searchContext
+                      .getSearcherAndTaxonomy()
+                      .searcher
+                      .explain(searchContext.getQuery(), hitBuilder.getLuceneDocId())
+                      .toString());
+            } catch (IOException ioException) {
+              // ignore failed explain
+            }
+          });
+    }
     return CollectorResult.newBuilder().setHitsResult(hitsResultBuilder.build()).build();
   }
 

@@ -17,6 +17,7 @@ package com.yelp.nrtsearch.server.grpc;
 
 import static com.yelp.nrtsearch.server.grpc.ReplicationServerClient.MAX_MESSAGE_BYTES_SIZE;
 
+import com.amazonaws.services.s3.AmazonS3;
 import com.google.api.HttpBody;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
@@ -44,6 +45,7 @@ import com.yelp.nrtsearch.server.luceneserver.AddDocumentHandler.DocumentIndexer
 import com.yelp.nrtsearch.server.luceneserver.analysis.AnalyzerCreator;
 import com.yelp.nrtsearch.server.luceneserver.custom.request.CustomRequestProcessor;
 import com.yelp.nrtsearch.server.luceneserver.field.FieldDefCreator;
+import com.yelp.nrtsearch.server.luceneserver.highlights.HighlighterService;
 import com.yelp.nrtsearch.server.luceneserver.index.IndexStateManager;
 import com.yelp.nrtsearch.server.luceneserver.index.handlers.FieldUpdateHandler;
 import com.yelp.nrtsearch.server.luceneserver.index.handlers.LiveSettingsV2Handler;
@@ -107,15 +109,18 @@ public class LuceneServer {
       LuceneServerConfiguration luceneServerConfiguration,
       @Named("legacyArchiver") Archiver archiver,
       @Named("incArchiver") Archiver incArchiver,
+      AmazonS3 amazonS3,
       CollectorRegistry collectorRegistry) {
     this.luceneServerConfiguration = luceneServerConfiguration;
     this.archiver = archiver;
     this.incArchiver = incArchiver;
     this.collectorRegistry = collectorRegistry;
-    this.pluginsService = new PluginsService(luceneServerConfiguration, collectorRegistry);
+    this.pluginsService =
+        new PluginsService(luceneServerConfiguration, amazonS3, collectorRegistry);
   }
 
-  private void start() throws IOException {
+  @VisibleForTesting
+  public void start() throws IOException {
     List<Plugin> plugins = pluginsService.loadPlugins();
     String serviceName = luceneServerConfiguration.getServiceName();
     String nodeName = luceneServerConfiguration.getNodeName();
@@ -188,21 +193,10 @@ public class LuceneServer {
             .start();
     logger.info(
         "Server started, listening on " + luceneServerConfiguration.getPort() + " for messages");
-
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread() {
-              @Override
-              public void run() {
-                // Use stderr here since the logger may have been reset by its JVM shutdown hook.
-                logger.error("*** shutting down gRPC server since JVM is shutting down");
-                LuceneServer.this.stop();
-                logger.error("*** server shut down");
-              }
-            });
   }
 
-  private void stop() {
+  @VisibleForTesting
+  public void stop() {
     if (server != null) {
       server.shutdown();
     }
@@ -279,6 +273,17 @@ public class LuceneServer {
         Injector injector = createInjector();
         luceneServer = injector.getInstance(LuceneServer.class);
         luceneServer.start();
+
+        Runtime.getRuntime()
+            .addShutdownHook(
+                new Thread(
+                    () -> {
+                      // Use stderr here since the logger may have been reset by its JVM shutdown
+                      // hook.
+                      logger.error("*** shutting down gRPC server since JVM is shutting down");
+                      luceneServer.stop();
+                      logger.error("*** server shut down");
+                    }));
       } catch (Throwable t) {
         logger.error("Uncaught exception", t);
         throw t;
@@ -365,6 +370,7 @@ public class LuceneServer {
       CustomRequestProcessor.initialize(configuration, plugins);
       FetchTaskCreator.initialize(configuration, plugins);
       FieldDefCreator.initialize(configuration, plugins);
+      HighlighterService.initialize(configuration, plugins);
       RescorerCreator.initialize(configuration, plugins);
       ScriptService.initialize(configuration, plugins);
       SimilarityCreator.initialize(configuration, plugins);
